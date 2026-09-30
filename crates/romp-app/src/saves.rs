@@ -20,12 +20,40 @@ pub fn file_iso_mtime(path: &Path) -> Option<String> {
 
 pub const BACKUPS_KEPT: usize = 10;
 
+/// The rotated backups in a save folder, oldest first by their timestamp names.
+fn stamped_backups(dir: &Path) -> Vec<(u128, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir.join("backup")) else {
+        return Vec::new();
+    };
+    let mut stamped: Vec<(u128, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?;
+            let stamp = name
+                .chars()
+                .all(|c| c.is_ascii_digit())
+                .then(|| name.parse::<u128>().ok())??;
+            Some((stamp, p))
+        })
+        .collect();
+    stamped.sort();
+    stamped
+}
+
 fn new_backup_dir(dir: &Path) -> io::Result<PathBuf> {
     let root = dir.join("backup");
-    let mut stamp = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
+    // Always newer than the newest backup, even when several are made within a millisecond
+    // and pruning freed an older name, so rotation drops the oldest and never the new one.
+    let newest = stamped_backups(dir)
+        .last()
+        .map_or(0, |(stamp, _)| stamp + 1);
+    let mut stamp = now.max(newest);
     while root.join(format!("{stamp:015}")).exists() {
         stamp += 1;
     }
@@ -35,27 +63,9 @@ fn new_backup_dir(dir: &Path) -> io::Result<PathBuf> {
 }
 
 fn prune_backups(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir.join("backup")) else {
-        return;
-    };
-    let mut stamped: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
-        })
-        .collect();
-    stamped.sort_by_key(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.parse::<u128>().ok())
-            .unwrap_or(0)
-    });
+    let stamped = stamped_backups(dir);
     let excess = stamped.len().saturating_sub(BACKUPS_KEPT);
-    for old in &stamped[..excess] {
+    for (_, old) in &stamped[..excess] {
         let _ = std::fs::remove_dir_all(old);
     }
 }
@@ -502,6 +512,24 @@ mod tests {
             std::fs::read_to_string(newest.join("game.srm")).unwrap(),
             format!("v{}", BACKUPS_KEPT + 2)
         );
+    }
+
+    #[test]
+    fn a_new_backup_is_never_the_one_rotated_away() {
+        // Backups named after a later time than now, as after several within one millisecond.
+        let dir = tempfile::tempdir().unwrap();
+        let ahead = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 60_000;
+        for i in 0..BACKUPS_KEPT as u128 {
+            std::fs::create_dir_all(dir.path().join(format!("backup/{:015}", ahead + i))).unwrap();
+        }
+        std::fs::write(dir.path().join("game.srm"), b"newest").unwrap();
+        let copy = backup(dir.path(), "game.srm").unwrap().unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"newest");
+        assert!(!dir.path().join(format!("backup/{ahead:015}")).exists());
     }
 
     #[test]
