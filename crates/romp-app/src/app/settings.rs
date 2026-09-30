@@ -1,5 +1,6 @@
 use super::{on_ui, with_controller, Controller, SCREEN_LIBRARY, SCREEN_SETTINGS};
 use crate::console_settings::{self, Chosen};
+use crate::cores::CoreChoices;
 use crate::details::human_size;
 use crate::mapping::{self, BUTTONS};
 use crate::players::KEYBOARD;
@@ -24,6 +25,8 @@ const KEY_HINTS: [(&str, &str); 6] = [
 
 const KEYBOARD_HINT: &str = "Choose a button, then press the key you want for it.";
 const PAD_HINT: &str = "Choose a button, then press the controller button you want for it.";
+const EMULATOR_DETAIL: &str =
+    "In-game saves sync under the emulator's name, and may not load in another emulator.";
 
 impl Controller {
     pub(super) fn save_players(&self) {
@@ -373,41 +376,93 @@ impl Controller {
         )
     }
 
+    pub(super) fn core_choices(&self) -> CoreChoices {
+        crate::cores::choices_from_json(
+            self.shared
+                .store
+                .lock()
+                .unwrap()
+                .get(crate::cores::CHOICES_STORE_KEY)
+                .as_deref(),
+        )
+    }
+
+    fn emulator_group(cores: &CoreChoices) -> Option<ConsoleGroup> {
+        let rows = console_settings::emulator_choices(cores);
+        (!rows.is_empty()).then(|| ConsoleGroup {
+            name: "Emulators".into(),
+            options: ModelRc::new(VecModel::from(
+                rows.into_iter()
+                    .map(|row| ConsoleOption {
+                        key: row.key.into(),
+                        label: row.system.into(),
+                        detail: EMULATOR_DETAIL.into(),
+                        choices: ModelRc::new(VecModel::from(
+                            row.choices
+                                .into_iter()
+                                .map(slint::SharedString::from)
+                                .collect::<Vec<_>>(),
+                        )),
+                        current: row.current as i32,
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+        })
+    }
+
     fn show_consoles(&self) {
         let Some(ui) = self.ui() else { return };
         let chosen = self.console_choices();
-        let groups: Vec<ConsoleGroup> = console_settings::consoles()
-            .map(|console| ConsoleGroup {
-                name: console.name.into(),
-                options: ModelRc::new(VecModel::from(
-                    console
-                        .settings
-                        .iter()
-                        .map(|setting| ConsoleOption {
-                            key: setting.key.into(),
-                            label: setting.label.into(),
-                            detail: setting.detail.into(),
-                            choices: ModelRc::new(VecModel::from(
-                                setting
-                                    .choices
-                                    .iter()
-                                    .map(|c| c.label.into())
-                                    .collect::<Vec<slint::SharedString>>(),
-                            )),
-                            current: console_settings::selected(setting, &chosen) as i32,
-                        })
-                        .collect::<Vec<_>>(),
-                )),
-            })
+        let cores = self.core_choices();
+        let groups: Vec<ConsoleGroup> = Self::emulator_group(&cores)
+            .into_iter()
+            .chain(console_settings::consoles(&cores).map(|console| {
+                ConsoleGroup {
+                    name: console.name.into(),
+                    options: ModelRc::new(VecModel::from(
+                        console
+                            .settings
+                            .iter()
+                            .map(|setting| ConsoleOption {
+                                key: setting.key.into(),
+                                label: setting.label.into(),
+                                detail: setting.detail.into(),
+                                choices: ModelRc::new(VecModel::from(
+                                    setting
+                                        .choices
+                                        .iter()
+                                        .map(|c| c.label.into())
+                                        .collect::<Vec<slint::SharedString>>(),
+                                )),
+                                current: console_settings::selected(setting, &chosen) as i32,
+                            })
+                            .collect::<Vec<_>>(),
+                    )),
+                }
+            }))
             .collect();
         ui.set_settings_consoles(ModelRc::new(VecModel::from(groups)));
     }
 
     pub(super) fn console_option_changed(&self, key: String, index: i32) {
-        let mut chosen = self.console_choices();
         let Ok(index) = usize::try_from(index) else {
             return;
         };
+        if let Some(platform) = console_settings::emulator_platform(&key) {
+            let mut cores = self.core_choices();
+            if crate::cores::choose_core(&mut cores, platform, index) {
+                let json = serde_json::to_string(&cores).expect("core choices serialize");
+                self.shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .set(crate::cores::CHOICES_STORE_KEY, &json);
+                // The chosen emulator has settings of its own.
+                self.show_consoles();
+            }
+            return;
+        }
+        let mut chosen = self.console_choices();
         if console_settings::choose(&mut chosen, &key, index) {
             let json = serde_json::to_string(&chosen).expect("console settings serialize");
             self.shared

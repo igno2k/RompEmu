@@ -22,10 +22,84 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     })
 }
 
+/// Moves a save RAM file the core can't use into the save folder's backups, so the core's own
+/// save RAM never overwrites it. The folder name isn't a plain timestamp, so the app's backup
+/// rotation keeps it.
+fn set_aside_sram(dir: &Path, path: &Path, len: usize) -> std::io::Result<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut n = 0;
+    let target = loop {
+        let candidate = dir
+            .join("backup")
+            .join(format!("{stamp:015}-{n}-sram-size-{len}"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        n += 1;
+    };
+    std::fs::create_dir_all(&target)?;
+    let target = target.join("game.srm");
+    std::fs::rename(path, &target)?;
+    Ok(target)
+}
+
+pub const SAVING_OFF: &str = "In-game saving is off for this session: the game's save file \
+could not be read or set aside, so it is left untouched.";
+
+#[derive(Debug, PartialEq, Eq)]
+enum SramLoad {
+    Loaded,
+    Absent,
+    SetAside(PathBuf),
+    /// The file is still there and must not be overwritten.
+    Untouchable,
+}
+
+/// Loads `game.srm` into the core's save RAM when it is the same size. A file of another size,
+/// such as one written by another emulator, is set aside rather than left to be overwritten.
+fn load_sram(dir: &Path, region: &mut [u8]) -> SramLoad {
+    let path = dir.join("game.srm");
+    match std::fs::read(&path) {
+        Ok(bytes) if bytes.len() == region.len() => {
+            region.copy_from_slice(&bytes);
+            info!(len = bytes.len(), "SRAM loaded");
+            SramLoad::Loaded
+        }
+        Ok(bytes) => match set_aside_sram(dir, &path, bytes.len()) {
+            Ok(kept) => {
+                warn!(
+                    file = bytes.len(),
+                    core = region.len(),
+                    kept = %kept.display(),
+                    "SRAM size mismatch; set the file aside"
+                );
+                SramLoad::SetAside(kept)
+            }
+            Err(e) => {
+                warn!(
+                    file = bytes.len(),
+                    core = region.len(),
+                    "SRAM size mismatch and the file could not be set aside, so it won't be saved over: {e}"
+                );
+                SramLoad::Untouchable
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SramLoad::Absent,
+        Err(e) => {
+            warn!("read SRAM, so it won't be saved over: {e}");
+            SramLoad::Untouchable
+        }
+    }
+}
+
 pub struct StateManager {
     dir: PathBuf,
     last_saved_sram: Option<Vec<u8>>,
     last_check: Instant,
+    sram_untouchable: bool,
 }
 
 impl StateManager {
@@ -34,6 +108,7 @@ impl StateManager {
             dir: dir.to_path_buf(),
             last_saved_sram: None,
             last_check: Instant::now(),
+            sram_untouchable: false,
         }
     }
 
@@ -46,20 +121,13 @@ impl StateManager {
         else {
             return;
         };
-        match std::fs::read(self.sram_path()) {
-            Ok(bytes) if bytes.len() == region.len() => {
-                region.copy_from_slice(&bytes);
-                info!(len = bytes.len(), "SRAM loaded");
-            }
-            Ok(bytes) => warn!(
-                file = bytes.len(),
-                core = region.len(),
-                "SRAM size mismatch; ignoring file"
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!("read SRAM: {e}"),
-        }
+        self.sram_untouchable = load_sram(&self.dir, region) == SramLoad::Untouchable;
         self.last_saved_sram = Some(region.to_vec());
+    }
+
+    /// What the player needs to know about in-game saving this session.
+    pub fn notice(&self) -> Option<&'static str> {
+        self.sram_untouchable.then_some(SAVING_OFF)
     }
 
     pub fn tick_sram(&mut self, core: &mut lr::Core, frontend: &mut Frontend) -> bool {
@@ -71,6 +139,9 @@ impl StateManager {
     }
 
     pub fn flush_sram(&mut self, core: &mut lr::Core, frontend: &mut Frontend) -> bool {
+        if self.sram_untouchable {
+            return false;
+        }
         let Some(snapshot) = (unsafe { core.memory_region(lr::RETRO_MEMORY_SAVE_RAM, frontend) })
             .map(|r| r.to_vec())
         else {
@@ -178,6 +249,64 @@ mod tests {
         assert_eq!(slot_file_name(1), "slot-1.state");
         assert_eq!(slot_file_name(5), "slot-5.state");
         assert_eq!(slot_file_name(9), "auto.state");
+    }
+
+    #[test]
+    fn save_ram_of_the_right_size_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut region = [0u8; 4];
+        assert_eq!(load_sram(dir.path(), &mut region), SramLoad::Absent);
+        std::fs::write(dir.path().join("game.srm"), [1, 2, 3, 4]).unwrap();
+        assert_eq!(load_sram(dir.path(), &mut region), SramLoad::Loaded);
+        assert_eq!(region, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn save_ram_of_another_size_is_set_aside_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.srm");
+        std::fs::write(&path, [9; 8]).unwrap();
+        let mut region = [0u8; 4];
+        let SramLoad::SetAside(kept) = load_sram(dir.path(), &mut region) else {
+            panic!("the file was not set aside");
+        };
+        assert_eq!(region, [0; 4]);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&kept).unwrap(), [9; 8]);
+        assert!(kept.starts_with(dir.path().join("backup")));
+        let folder = kept
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(folder.ends_with("-sram-size-8"), "{folder}");
+        assert!(
+            !folder.chars().all(|c| c.is_ascii_digit()),
+            "kept out of rotation"
+        );
+
+        std::fs::write(&path, [7; 8]).unwrap();
+        let SramLoad::SetAside(again) = load_sram(dir.path(), &mut region) else {
+            panic!("the second file was not set aside");
+        };
+        assert_ne!(kept, again);
+        assert_eq!(std::fs::read(&kept).unwrap(), [9; 8]);
+    }
+
+    #[test]
+    fn an_unreadable_save_is_left_alone_and_saving_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder in place of the file can't be read as one.
+        std::fs::create_dir(dir.path().join("game.srm")).unwrap();
+        let mut region = [5u8; 4];
+        assert_eq!(load_sram(dir.path(), &mut region), SramLoad::Untouchable);
+        assert!(dir.path().join("game.srm").is_dir());
+        let mut saves = StateManager::new(dir.path());
+        assert_eq!(saves.notice(), None);
+        saves.sram_untouchable = true;
+        assert_eq!(saves.notice(), Some(SAVING_OFF));
     }
 
     #[test]

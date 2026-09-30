@@ -1,5 +1,5 @@
 use super::{on_ui, Controller};
-use crate::cores::core_for_platform;
+use crate::cores::CoreInfo;
 use crate::paths;
 use crate::play::CoreIdentity;
 use crate::romm::client::{Client, Error};
@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 pub(super) struct PendingLaunch {
     pub detail: GameDetail,
     pub rom: PathBuf,
-    pub jit: bool,
+    pub info: &'static CoreInfo,
+    pub saves: GameSaves,
     pub core: PathBuf,
     pub conflict: SramConflict,
 }
@@ -38,6 +39,87 @@ pub(super) fn conflict_text(conflict: &SramConflict) -> String {
 
 fn version_key(rom_id: i64) -> String {
     format!("core_version:{rom_id}")
+}
+
+/// The id of the emulator a game was last played with, whose files are in its save folder.
+fn core_key(rom_id: i64) -> String {
+    format!("core:{rom_id}")
+}
+
+/// Gets a game's save folder ready for `core`. When the game was last played with another
+/// emulator, that emulator's unsynced saves are first synced under its own name, then its
+/// save states, and its in-game save unless both emulators keep the same file, are set aside,
+/// so they are never loaded by, or synced under the name of, the new one. When unsynced saves
+/// can't be synced first, nothing is moved and the error is the status to show: the game
+/// doesn't start, and keeps its emulator until the saves sync or the choice is undone.
+pub(super) async fn switch_core(
+    online: Option<(&Client, &str)>,
+    store: &Mutex<Store>,
+    game: &GameSaves,
+    core: &CoreInfo,
+    previous: Option<(&'static CoreInfo, &GameSaves)>,
+) -> Result<(), String> {
+    let id = game.rom_id;
+    if let Some((previous, old)) = previous {
+        let pending = store.lock().unwrap().pending().contains(&id);
+        if pending {
+            let refused = || {
+                format!(
+                    "Connect to your server once so {}'s saves can sync before this game \
+                     switches to {}. To play now, choose {} again in Settings.",
+                    previous.name, core.name, previous.name
+                )
+            };
+            let version = store.lock().unwrap().get(&version_key(id));
+            let Some((client, device)) = online else {
+                tracing::warn!(
+                    "not switching {id} to {}: {}'s saves are unsynced",
+                    core.id,
+                    previous.id
+                );
+                return Err(refused());
+            };
+            if let Err(e) = sync_game(client, store, device, old, version.as_deref()).await {
+                tracing::warn!(
+                    "not switching {id} to {}: syncing {}'s saves: {e}",
+                    core.id,
+                    previous.id
+                );
+                return Err(refused());
+            }
+            store.lock().unwrap().remove_pending(id);
+        }
+        let keep_save =
+            saves::same_save_ram(previous.id, core.id) && old.save_file == game.save_file;
+        match saves::set_aside_for_core_switch(&old.dir, previous.id, &old.save_file, keep_save) {
+            Ok(Some(kept)) => tracing::info!(
+                "game {id} now plays with {}; {}'s saves set aside in {}",
+                core.id,
+                previous.id,
+                kept.display()
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("setting aside {id}'s {} saves: {e}", previous.id);
+                return Err(format!(
+                    "Could not set aside the saves from {}: {e}",
+                    previous.name
+                ));
+            }
+        }
+        if keep_save {
+            tracing::info!(
+                "game {id} keeps its in-game save: {} and {} share it",
+                previous.id,
+                core.id
+            );
+        }
+        let mut store = store.lock().unwrap();
+        store.remove(&version_key(id));
+        store.remove_pending(id);
+    }
+    store.lock().unwrap().set(&core_key(id), core.id);
+    Ok(())
 }
 
 async fn sync_game(
@@ -92,19 +174,39 @@ impl Controller {
         self.connect();
     }
 
+    fn last_core(&self, rom_id: i64) -> Option<String> {
+        self.shared.store.lock().unwrap().get(&core_key(rom_id))
+    }
+
+    /// How a game starts with the emulator chosen for its system, and the saves it syncs.
+    pub(super) fn plan_launch(&self, detail: &GameDetail) -> Option<saves::Launch> {
+        saves::plan_launch(
+            &detail.platform_slug,
+            &self.core_choices(),
+            self.last_core(detail.id).as_deref(),
+            detail.id,
+            paths::game_save_dir(&paths::data_dir(), &self.server(), detail.id),
+            &detail.title,
+            detail.local_path.as_deref().map(std::path::Path::new),
+        )
+    }
+
+    pub(super) fn saves_with(&self, core: &CoreInfo, detail: &GameDetail) -> GameSaves {
+        saves::game_saves(
+            core,
+            detail.id,
+            paths::game_save_dir(&paths::data_dir(), &self.server(), detail.id),
+            &detail.title,
+            detail.local_path.as_deref().map(std::path::Path::new),
+        )
+    }
+
+    /// The saves in a game's folder, as the emulator it was last played with syncs them, so
+    /// they are never uploaded under another emulator's name.
     pub(super) fn game_saves(&self, detail: &GameDetail) -> Option<GameSaves> {
-        let core = core_for_platform(&detail.platform_slug)?;
-        let dir = paths::game_save_dir(&paths::data_dir(), &self.server(), detail.id);
-        let rom = detail.local_path.as_deref().map(std::path::Path::new);
-        let (save_file, save_emulator) = crate::saves::in_game_save(core.id, &dir, rom);
-        Some(GameSaves {
-            rom_id: detail.id,
-            dir,
-            title: detail.title.clone(),
-            emulator: core.id.to_string(),
-            save_file,
-            save_emulator,
-        })
+        let core =
+            crate::cores::played_core(&detail.platform_slug, self.last_core(detail.id).as_deref())?;
+        Some(self.saves_with(core, detail))
     }
 
     pub(super) fn clear_conflict(&self) {
@@ -129,11 +231,9 @@ impl Controller {
         let Some(pending) = self.pending_launch.borrow_mut().take() else {
             return;
         };
-        let (Some(client), Some(device), Some(game)) = (
-            self.client.borrow().clone(),
-            self.sync_device(),
-            self.game_saves(&pending.detail),
-        ) else {
+        let game = pending.saves.clone();
+        let (Some(client), Some(device)) = (self.client.borrow().clone(), self.sync_device())
+        else {
             self.preparing.set(false);
             if let Some(ui) = self.ui() {
                 ui.set_save_conflict(false);
@@ -151,7 +251,7 @@ impl Controller {
                 if let Err(e) = result {
                     tracing::warn!("resolving save conflict: {e}");
                 }
-                c.start_game(pending.detail, pending.rom, pending.jit, pending.core);
+                c.start_game(pending.detail, pending.rom, pending.info, pending.core);
             });
         });
     }
@@ -260,6 +360,110 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn core(id: &str) -> &'static CoreInfo {
+        crate::cores::all_cores().find(|c| c.id == id).unwrap()
+    }
+
+    struct Switch {
+        dir: tempfile::TempDir,
+        store: Mutex<Store>,
+        old: GameSaves,
+        new: GameSaves,
+    }
+
+    fn switch(from: &str, to: &str, pending: bool) -> Switch {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(saves::SRAM_FILE), b"card").unwrap();
+        std::fs::write(dir.path().join(saves::AUTO_STATE), b"state").unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store.set(&core_key(5), from);
+        if pending {
+            store.add_pending(5);
+        }
+        Switch {
+            old: saves::game_saves(core(from), 5, dir.path().into(), "Game", None),
+            new: saves::game_saves(core(to), 5, dir.path().into(), "Game", None),
+            store: Mutex::new(store),
+            dir,
+        }
+    }
+
+    fn untouched(s: &Switch, from: &str) {
+        assert!(s.dir.path().join(saves::SRAM_FILE).exists());
+        assert!(s.dir.path().join(saves::AUTO_STATE).exists());
+        assert!(!s.dir.path().join("backup").exists());
+        let store = s.store.lock().unwrap();
+        assert_eq!(store.pending(), [5]);
+        assert_eq!(store.get(&core_key(5)).as_deref(), Some(from));
+    }
+
+    #[tokio::test]
+    async fn unsynced_saves_offline_keep_the_game_on_its_emulator() {
+        let s = switch("nestopia", "mesen", true);
+        let previous = Some((core("nestopia"), &s.old));
+        let err = switch_core(None, &s.store, &s.new, core("mesen"), previous)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Connect to your server once"), "{err}");
+        assert!(
+            err.contains("Nestopia UE") && err.contains("Mesen"),
+            "{err}"
+        );
+        untouched(&s, "nestopia");
+    }
+
+    #[tokio::test]
+    async fn unsynced_saves_that_fail_to_sync_keep_the_game_on_its_emulator() {
+        let s = switch("nestopia", "mesen", true);
+        let client = Client::new("http://127.0.0.1:9/".parse().unwrap()).with_token("t".into());
+        let previous = Some((core("nestopia"), &s.old));
+        let online = Some((&client, "device"));
+        let err = switch_core(online, &s.store, &s.new, core("mesen"), previous)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("Connect to your server once"), "{err}");
+        untouched(&s, "nestopia");
+    }
+
+    #[tokio::test]
+    async fn synced_saves_are_set_aside_when_the_emulator_changes() {
+        let s = switch("nestopia", "mesen", false);
+        let previous = Some((core("nestopia"), &s.old));
+        switch_core(None, &s.store, &s.new, core("mesen"), previous)
+            .await
+            .unwrap();
+        assert!(!s.dir.path().join(saves::SRAM_FILE).exists());
+        assert!(!s.dir.path().join(saves::AUTO_STATE).exists());
+        assert_eq!(
+            s.store.lock().unwrap().get(&core_key(5)).as_deref(),
+            Some("mesen")
+        );
+    }
+
+    #[tokio::test]
+    async fn emulators_with_the_same_save_ram_keep_the_in_game_save() {
+        for (from, to) in [
+            ("mednafen_psx_hw", "swanstation"),
+            ("swanstation", "mednafen_psx_hw"),
+        ] {
+            let s = switch(from, to, false);
+            let previous = Some((core(from), &s.old));
+            switch_core(None, &s.store, &s.new, core(to), previous)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(s.dir.path().join(saves::SRAM_FILE)).unwrap(),
+                b"card",
+                "{from} to {to}"
+            );
+            assert!(
+                !s.dir.path().join(saves::AUTO_STATE).exists(),
+                "states are core-bound"
+            );
+            assert_eq!(s.new.save_emulator, to, "it syncs under the new name");
+        }
+    }
 
     #[test]
     fn conflict_text_names_both_times() {

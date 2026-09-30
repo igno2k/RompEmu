@@ -4,9 +4,18 @@ All notable changes to Romp are listed here. The format follows [Keep a Changelo
 
 ## [Unreleased]
 
+### Added
+
+- A choice of emulator for some systems in the Consoles tab of Settings: SwanStation for PlayStation, Gambatte for Game Boy and Game Boy Color, and Mesen for the NES, Famicom and Famicom Disk System. In-game saves sync under the chosen emulator's name, and SwanStation keeps memory card 1 as the game's save, like RetroArch.
+
 ### Changed
 
 - On Windows and Linux, GameCube, Wii, PSP, Dreamcast, PlayStation, N64 and PS2 games draw through Vulkan when the computer has a working Vulkan driver, and through OpenGL otherwise. N64 gets the accurate paraLLEl-RDP renderer, and the resolution settings in the Consoles tab.
+
+### Fixed
+
+- A save file of the wrong size for the emulator, such as one from another emulator, is moved to the game's backup folder instead of being overwritten.
+- When a game starts with a different emulator than last time, the other one's saves and save states are synced under its name and set aside, never loaded or uploaded by the new one. Between Beetle PSX HW and SwanStation, which share the memory card format, the in-game save stays. A game whose last emulator's saves can't sync first doesn't switch.
 
 ## [0.6.0] - 2026-09-29
 

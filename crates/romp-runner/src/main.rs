@@ -188,6 +188,10 @@ fn run(args: &Args, frontend: &mut Frontend, link: &Link) -> anyhow::Result<()> 
         fps: av.timing.fps,
         sample_rate: av.timing.sample_rate,
     });
+    if let Some(notice) = saves.notice() {
+        warn!("{notice}");
+        link.send(&RunnerMsg::Notice(notice.into()));
+    }
     let mut rotation = lr::rotation();
     link.send(&RunnerMsg::Rotation(rotation as u8));
     link.send(&RunnerMsg::Controllers {

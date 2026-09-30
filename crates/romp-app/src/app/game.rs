@@ -1,7 +1,7 @@
 use super::save_sync::PendingLaunch;
 use super::{on_ui, with_controller, Controller, SCREEN_GAME, SCREEN_LIBRARY, SCREEN_SETTINGS};
 use crate::bios;
-use crate::cores::core_for_platform;
+use crate::cores::{core_for_platform, CoreInfo};
 use crate::details;
 use crate::download::DownloadError;
 use crate::fetch::download_game;
@@ -9,7 +9,7 @@ use crate::paths;
 use crate::play::{self, CoreIdentity, GameOptions};
 use crate::restore::{game_window_key, Placement};
 use crate::romm::client::Error;
-use crate::saves::{self, SramOutcome};
+use crate::saves::{self, GameSaves, SramOutcome};
 use crate::store::GameDetail;
 use crate::xemu::{self, Xemu};
 use crate::{GameCard, Shot};
@@ -495,9 +495,15 @@ impl Controller {
         if detail.platform_slug == xemu::PLATFORM {
             return self.play_with_xemu(detail, rom);
         }
-        let Some(core) = core_for_platform(&detail.platform_slug) else {
+        let Some(launch) = self.plan_launch(&detail) else {
             return;
         };
+        let core = launch.core;
+        let game = launch.saves;
+        // The saves another emulator left, synced under its name before they are set aside.
+        let switch = launch
+            .previous
+            .map(|previous| (previous, self.saves_with(previous, &detail)));
         self.preparing.set(true);
         ui.set_game_status("Getting ready…".into());
         let cores = self.shared.cores.clone();
@@ -505,10 +511,8 @@ impl Controller {
         let client = self.client.borrow().clone();
         let offline = self.offline.get();
         let id = detail.id;
-        let sync = self
-            .sync_device()
-            .zip(self.game_saves(&detail))
-            .filter(|_| !offline);
+        let device = self.sync_device().filter(|_| !offline);
+        let store = self.shared.store.clone();
         self.shared.rt.spawn(async move {
             let base = crate::cores::download_base(core);
             let current = match cores.installed(core) {
@@ -557,14 +561,27 @@ impl Controller {
                     }
                 }
             }
-            let sram = match (&client, sync) {
-                (Some(client), Some((device, game))) => {
+            if core_path.is_ok() {
+                let previous = switch.as_ref().map(|(p, old)| (*p, old));
+                let online = client.as_ref().zip(device.as_deref());
+                if let Err(e) =
+                    super::save_sync::switch_core(online, &store, &game, core, previous).await
+                {
+                    on_ui(move |c| {
+                        c.preparing.set(false);
+                        c.game_status(id, e);
+                    });
+                    return;
+                }
+            }
+            let sram = match (&client, device) {
+                (Some(client), Some(device)) => {
                     on_ui(move |c| c.game_status(id, "Syncing your save…".into()));
                     Some(saves::sync_sram(client, &device, &game).await)
                 }
                 _ => None,
             };
-            on_ui(move |c| c.launch_ready(detail, rom, core.jit, core_path, missing, sram));
+            on_ui(move |c| c.launch_ready(detail, rom, (core, game), core_path, missing, sram));
         });
     }
 
@@ -705,7 +722,7 @@ impl Controller {
         &self,
         detail: GameDetail,
         rom: PathBuf,
-        jit: bool,
+        (info, saves): (&'static CoreInfo, GameSaves),
         core_path: Result<PathBuf, String>,
         missing: Vec<String>,
         sram: Option<Result<SramOutcome, Error>>,
@@ -726,7 +743,8 @@ impl Controller {
                 return self.show_conflict(PendingLaunch {
                     detail,
                     rom,
-                    jit,
+                    info,
+                    saves,
                     core,
                     conflict,
                 });
@@ -734,15 +752,20 @@ impl Controller {
             Some(Err(e)) => tracing::warn!("save sync before launch: {e}"),
             _ => {}
         }
-        self.start_game(detail, rom, jit, core);
+        self.start_game(detail, rom, info, core);
     }
 
-    pub(super) fn start_game(&self, detail: GameDetail, rom: PathBuf, jit: bool, core: PathBuf) {
+    pub(super) fn start_game(
+        &self,
+        detail: GameDetail,
+        rom: PathBuf,
+        info: &'static CoreInfo,
+        core: PathBuf,
+    ) {
         self.preparing.set(false);
         let save_dir = paths::game_save_dir(&paths::data_dir(), &self.server(), detail.id);
         let prefs = self.prefs.get();
-        let reliable = core_for_platform(&detail.platform_slug)
-            .is_some_and(|core| crate::cores::resumes_reliably(core.id));
+        let reliable = crate::cores::resumes_reliably(info.id);
         let load_slot =
             (reliable && prefs.resume && save_dir.join(crate::saves::AUTO_STATE).exists())
                 .then_some(0);
@@ -751,14 +774,10 @@ impl Controller {
             rom,
             save_dir,
             title: detail.title.clone(),
-            jit,
-            vulkan: core_for_platform(&detail.platform_slug)
-                .is_some_and(|core| crate::cores::uses_vulkan(core.id)),
-            options: core_for_platform(&detail.platform_slug)
-                .map(|core| crate::console_settings::core_options(core.id, &self.console_choices()))
-                .unwrap_or_default(),
-            split_screens: core_for_platform(&detail.platform_slug)
-                .is_some_and(|core| core.id == "desmume"),
+            jit: info.jit,
+            vulkan: crate::cores::uses_vulkan(info.id),
+            options: crate::console_settings::core_options(info.id, &self.console_choices()),
+            split_screens: info.id == "desmume",
             gamepads: self.gamepads.clone(),
             players: self.players.clone(),
             prefs,
@@ -766,10 +785,8 @@ impl Controller {
             auto_state: reliable,
             mappings: self.mappings.clone(),
             nintendo: crate::cores::is_nintendo(&detail.platform_slug),
-            mouse: core_for_platform(&detail.platform_slug)
-                .is_some_and(|core| crate::cores::uses_mouse(core.id)),
-            computer: core_for_platform(&detail.platform_slug)
-                .is_some_and(|core| crate::cores::is_computer(core.id)),
+            mouse: crate::cores::uses_mouse(info.id),
+            computer: crate::cores::is_computer(info.id),
             port_devices: self.saved_ports(detail.id),
             volume_changed: Box::new(|volume| {
                 let _ = slint::invoke_from_event_loop(move || {

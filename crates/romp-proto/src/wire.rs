@@ -62,6 +62,17 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_notices() {
+        let mut buf = Vec::new();
+        let msg = RunnerMsg::Notice("saving is off".into());
+        write_msg(&mut buf, &msg).unwrap();
+        assert_eq!(
+            read_msg::<_, RunnerMsg>(&mut Cursor::new(buf)).unwrap(),
+            msg
+        );
+    }
+
+    #[test]
     fn round_trips_runner_messages_with_strings() {
         let mut buf = Vec::new();
         let msg = RunnerMsg::Exited {

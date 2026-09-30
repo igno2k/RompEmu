@@ -1,3 +1,4 @@
+use crate::cores::{CoreChoices, CoreInfo};
 use crate::romm::client::{Client, Error, SaveUpload};
 use crate::romm::types::ClientSave;
 use std::io;
@@ -178,6 +179,107 @@ pub fn in_game_save(core_id: &str, dir: &Path, rom: Option<&Path>) -> (String, S
         }
         _ => (SRAM_FILE.into(), core_id.into()),
     }
+}
+
+/// A game's saves as the emulator `core` keeps and syncs them.
+pub fn game_saves(
+    core: &CoreInfo,
+    rom_id: i64,
+    dir: PathBuf,
+    title: &str,
+    rom: Option<&Path>,
+) -> GameSaves {
+    let (save_file, save_emulator) = in_game_save(core.id, &dir, rom);
+    GameSaves {
+        rom_id,
+        dir,
+        title: title.to_string(),
+        emulator: core.id.to_string(),
+        save_file,
+        save_emulator,
+    }
+}
+
+/// What starting a game involves: the emulator it plays with, the saves that emulator syncs,
+/// and the emulator it was last played with when that was a different one.
+pub struct Launch {
+    pub core: &'static CoreInfo,
+    pub saves: GameSaves,
+    pub previous: Option<&'static CoreInfo>,
+}
+
+/// Plans a game's start from its system, the emulators chosen in Settings and the emulator the
+/// game was last played with. The launch, its options and the saves it syncs all use `core`.
+pub fn plan_launch(
+    platform_slug: &str,
+    choices: &CoreChoices,
+    last_core: Option<&str>,
+    rom_id: i64,
+    dir: PathBuf,
+    title: &str,
+    rom: Option<&Path>,
+) -> Option<Launch> {
+    let core = crate::cores::core_for(platform_slug, choices)?;
+    let previous = crate::cores::played_core(platform_slug, last_core).filter(|p| p.id != core.id);
+    Some(Launch {
+        core,
+        saves: game_saves(core, rom_id, dir, title, rom),
+        previous,
+    })
+}
+
+/// Emulators whose save RAM is the same file, byte for byte, so a game's in-game save carries
+/// over when it switches between them. Keep this to pairs checked against both cores' source:
+/// Beetle PSX HW and SwanStation (memory card 1 as save RAM, "Libretro") both expose memory
+/// card 1 as a raw 128 KiB PlayStation memory card.
+const SAME_SAVE_RAM: [(&str, &str); 1] = [("mednafen_psx_hw", "swanstation")];
+
+pub fn same_save_ram(a: &str, b: &str) -> bool {
+    SAME_SAVE_RAM
+        .iter()
+        .any(|&(x, y)| (x, y) == (a, b) || (y, x) == (a, b))
+}
+
+/// Moves the save states, and unless `keep_save` the in-game save, another emulator left in a
+/// game's save folder into a backup of their own, so the next emulator neither loads nor syncs
+/// them under its name. The backup is named after that emulator and kept out of the backup
+/// rotation.
+pub fn set_aside_for_core_switch(
+    dir: &Path,
+    previous: &str,
+    save_file: &str,
+    keep_save: bool,
+) -> io::Result<Option<PathBuf>> {
+    let mut files: Vec<String> = Vec::new();
+    if !keep_save {
+        files.push(save_file.to_string());
+    }
+    files.extend(STATE_SLOTS.iter().map(|slot| format!("{slot}.state")));
+    files.retain(|f| dir.join(f).is_file());
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let root = dir.join("backup");
+    let mut n = 0;
+    let target = loop {
+        let candidate = root.join(format!("{stamp:015}-{n}-{previous}"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        n += 1;
+    };
+    for file in files {
+        let destination = target.join(&file);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(dir.join(&file), destination)?;
+    }
+    Ok(Some(target))
 }
 
 /// PS2 memory cards at the top of a save folder, newest first.
@@ -591,6 +693,150 @@ mod tests {
         );
     }
 
+    fn other_psx_core() -> &'static CoreInfo {
+        let default = crate::cores::core_for_platform("psx").unwrap();
+        let other = crate::cores::cores_for_platform("psx")[1];
+        assert_ne!(other, default);
+        other
+    }
+
+    #[test]
+    fn a_launch_syncs_its_saves_under_the_emulator_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = other_psx_core();
+        let mut choices = CoreChoices::new();
+        choices.insert("psx".into(), other.id.into());
+        let launch = plan_launch(
+            "psx",
+            &choices,
+            Some(other.id),
+            5,
+            dir.path().into(),
+            "Game",
+            None,
+        )
+        .unwrap();
+        assert_eq!(launch.core, other);
+        assert_eq!(launch.saves.emulator, launch.core.id);
+        assert_eq!(launch.saves.save_emulator, launch.core.id);
+        assert!(launch.previous.is_none());
+
+        let default = plan_launch(
+            "psx",
+            &CoreChoices::new(),
+            None,
+            5,
+            dir.path().into(),
+            "Game",
+            None,
+        )
+        .unwrap();
+        assert_eq!(Some(default.core), crate::cores::core_for_platform("psx"));
+        assert_eq!(default.saves.emulator, default.core.id);
+        assert!(plan_launch("xbox", &choices, None, 5, dir.path().into(), "Game", None).is_none());
+    }
+
+    #[test]
+    fn a_launch_notices_the_game_last_played_with_another_emulator() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = other_psx_core();
+        let default = crate::cores::core_for_platform("psx").unwrap();
+        let mut choices = CoreChoices::new();
+        choices.insert("psx".into(), other.id.into());
+        let plan = |choices: &CoreChoices, last: Option<&str>| {
+            plan_launch("psx", choices, last, 5, dir.path().into(), "Game", None).unwrap()
+        };
+        assert_eq!(plan(&choices, Some(default.id)).previous, Some(default));
+        // An older game counts as played with the system's earlier default.
+        let earlier = crate::cores::played_core("psx", None).unwrap();
+        let unless_same = |core: &CoreInfo| Some(earlier).filter(|e| e.id != core.id);
+        assert_eq!(plan(&choices, None).previous, unless_same(other));
+        assert_eq!(
+            plan(&CoreChoices::new(), Some(other.id)).previous,
+            Some(other)
+        );
+        assert_eq!(
+            plan(&CoreChoices::new(), None).previous,
+            unless_same(default)
+        );
+        // Saves left by the earlier emulator keep its name until they are set aside.
+        let old = game_saves(default, 5, dir.path().into(), "Game", None);
+        assert_eq!(old.emulator, default.id);
+    }
+
+    #[test]
+    fn only_listed_emulators_share_their_save_ram() {
+        assert!(same_save_ram("mednafen_psx_hw", "swanstation"));
+        assert!(same_save_ram("swanstation", "mednafen_psx_hw"));
+        assert!(!same_save_ram("mgba", "gambatte"));
+        assert!(!same_save_ram("nestopia", "mesen"));
+        assert!(!same_save_ram("swanstation", "swanstation_x"));
+        // The pair only holds while SwanStation keeps memory card 1 in save RAM.
+        assert!(crate::cores::default_options("swanstation").contains(&(
+            "swanstation_MemoryCards_Card1Type".into(),
+            "Libretro".into()
+        )));
+    }
+
+    #[test]
+    fn a_shared_save_stays_while_the_states_are_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(SRAM_FILE), b"card").unwrap();
+        std::fs::write(dir.path().join(AUTO_STATE), b"auto").unwrap();
+        let kept = set_aside_for_core_switch(dir.path(), "mednafen_psx_hw", SRAM_FILE, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(dir.path().join(SRAM_FILE)).unwrap(), b"card");
+        assert!(!kept.join(SRAM_FILE).exists());
+        assert_eq!(std::fs::read(kept.join(AUTO_STATE)).unwrap(), b"auto");
+        std::fs::remove_file(dir.path().join(SRAM_FILE)).unwrap();
+        assert_eq!(
+            set_aside_for_core_switch(dir.path(), "mednafen_psx_hw", SRAM_FILE, true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn switching_emulator_sets_the_old_saves_aside_out_of_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            set_aside_for_core_switch(dir.path(), "mednafen_psx_hw", SRAM_FILE, false).unwrap(),
+            None
+        );
+        std::fs::write(dir.path().join(SRAM_FILE), b"card").unwrap();
+        std::fs::write(dir.path().join(AUTO_STATE), b"auto").unwrap();
+        std::fs::write(dir.path().join("slot-2.state"), b"two").unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"other").unwrap();
+        let kept = set_aside_for_core_switch(dir.path(), "mednafen_psx_hw", SRAM_FILE, false)
+            .unwrap()
+            .unwrap();
+        assert!(kept.starts_with(dir.path().join("backup")));
+        assert!(kept.to_string_lossy().ends_with("-mednafen_psx_hw"));
+        for (file, bytes) in [
+            (SRAM_FILE, &b"card"[..]),
+            (AUTO_STATE, b"auto"),
+            ("slot-2.state", b"two"),
+        ] {
+            assert!(!dir.path().join(file).exists(), "{file} left behind");
+            assert_eq!(std::fs::read(kept.join(file)).unwrap(), bytes);
+        }
+        assert!(dir.path().join("keep.txt").exists());
+        for i in 0..(BACKUPS_KEPT + 2) {
+            std::fs::write(dir.path().join(SRAM_FILE), format!("v{i}")).unwrap();
+            backup(dir.path(), SRAM_FILE).unwrap();
+        }
+        assert!(
+            kept.join(SRAM_FILE).exists(),
+            "rotation removed the set-aside saves"
+        );
+        std::fs::write(dir.path().join(AUTO_STATE), b"again").unwrap();
+        let again = set_aside_for_core_switch(dir.path(), "mednafen_psx_hw", SRAM_FILE, false)
+            .unwrap()
+            .unwrap();
+        assert_ne!(again, kept);
+        assert_eq!(std::fs::read(kept.join(AUTO_STATE)).unwrap(), b"auto");
+    }
+
     #[test]
     fn each_emulator_syncs_its_own_in_game_save() {
         let dir = tempfile::tempdir().unwrap();
@@ -602,6 +848,13 @@ mod tests {
             in_game_save("armsx2", dir.path(), None),
             (ARMSX2_CARD.into(), "pcsx2".into())
         );
+        // The names RetroArch-based clients derive from the core file, e.g. swanstation_libretro.
+        for core in ["swanstation", "gambatte", "mesen"] {
+            assert_eq!(
+                in_game_save(core, dir.path(), None),
+                (SRAM_FILE.into(), core.into())
+            );
+        }
         let rom = Path::new("/roms/ps2/Ico (USA).m3u");
         assert_eq!(
             in_game_save("pcsx2", dir.path(), Some(rom)),

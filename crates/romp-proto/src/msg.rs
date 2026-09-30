@@ -64,4 +64,6 @@ pub enum RunnerMsg {
     Exited {
         error: Option<String>,
     },
+    /// Something the player should know about for the rest of the session.
+    Notice(String),
 }

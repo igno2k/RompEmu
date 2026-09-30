@@ -1031,6 +1031,10 @@ fn handle_event(
                 format!("Slot {slot} is empty or unreadable")
             },
         ),
+        SessionEvent::Runner(RunnerMsg::Notice(text)) => {
+            tracing::warn!("{text}");
+            ui.set_status(text.into());
+        }
         SessionEvent::Runner(RunnerMsg::Exited { error: Some(error) }) => {
             ui.set_status(error.into());
         }

@@ -195,15 +195,113 @@ static CORES: &[(&[&str], CoreInfo)] = &[
     ),
 ];
 
+// Other emulators a system can be played with, chosen in Settings in place of the one above.
+static ALTERNATIVES: &[(&[&str], CoreInfo)] = &[
+    (
+        &["psx"],
+        core("swanstation", "SwanStation", "swanstation_libretro", false),
+    ),
+    (
+        &["gb", "gbc"],
+        core("gambatte", "Gambatte", "gambatte_libretro", false),
+    ),
+    (
+        &["nes", "famicom", "fds"],
+        core("mesen", "Mesen", "mesen_libretro", false),
+    ),
+];
+
+/// Every emulator Romp can download on this computer, including the ones only used when chosen.
 pub fn all_cores() -> impl Iterator<Item = &'static CoreInfo> {
-    CORES.iter().map(|(_, core)| core)
+    CORES.iter().chain(ALTERNATIVES).map(|(_, core)| core)
 }
 
+/// The emulator a system plays with unless another one is chosen.
 pub fn core_for_platform(slug: &str) -> Option<&'static CoreInfo> {
     CORES
         .iter()
         .find(|(slugs, _)| slugs.contains(&slug))
         .map(|(_, c)| c)
+}
+
+/// The emulators a system can play with, its default first.
+pub fn cores_for_platform(slug: &str) -> Vec<&'static CoreInfo> {
+    let mut cores: Vec<&'static CoreInfo> = core_for_platform(slug).into_iter().collect();
+    for (_, core) in CORES
+        .iter()
+        .chain(ALTERNATIVES)
+        .filter(|(slugs, _)| slugs.contains(&slug))
+    {
+        if !cores.iter().any(|c| c.id == core.id) {
+            cores.push(core);
+        }
+    }
+    cores
+}
+
+/// The systems that can play with more than one emulator.
+pub fn choosable_platforms() -> Vec<&'static str> {
+    let mut slugs: Vec<&'static str> = Vec::new();
+    for (platforms, _) in ALTERNATIVES {
+        for slug in platforms.iter().copied() {
+            if !slugs.contains(&slug) && cores_for_platform(slug).len() > 1 {
+                slugs.push(slug);
+            }
+        }
+    }
+    slugs
+}
+
+pub const CHOICES_STORE_KEY: &str = "cores";
+
+/// The emulator chosen for each system, by platform slug and core id. Systems without an
+/// entry use their default.
+pub type CoreChoices = std::collections::BTreeMap<String, String>;
+
+pub fn choices_from_json(text: Option<&str>) -> CoreChoices {
+    text.and_then(|t| serde_json::from_str(t).ok())
+        .unwrap_or_default()
+}
+
+/// The emulator a system plays with: the chosen one when this computer can use it for that
+/// system, the default otherwise.
+pub fn core_for(slug: &str, choices: &CoreChoices) -> Option<&'static CoreInfo> {
+    choices
+        .get(slug)
+        .and_then(|id| cores_for_platform(slug).into_iter().find(|c| c.id == id))
+        .or_else(|| core_for_platform(slug))
+}
+
+/// The emulator games of a system played with before Romp remembered each game's emulator.
+fn earlier_default(slug: &str) -> Option<&'static CoreInfo> {
+    core_for_platform(slug)
+}
+
+/// The emulator a game was last played with, from the id Romp remembered for it. Games from
+/// before Romp remembered it played with the system's earlier default.
+pub fn played_core(slug: &str, last: Option<&str>) -> Option<&'static CoreInfo> {
+    match last {
+        Some(id) => all_cores()
+            .find(|c| c.id == id)
+            .or_else(|| earlier_default(slug)),
+        None => earlier_default(slug),
+    }
+}
+
+/// Chooses the emulator at `index` in [`cores_for_platform`] for a system, returning false
+/// when there is no such emulator. Choosing the default forgets the choice, so the system
+/// follows the default if it changes.
+pub fn choose_core(choices: &mut CoreChoices, slug: &str, index: usize) -> bool {
+    let cores = cores_for_platform(slug);
+    let Some(core) = cores.get(index) else {
+        return false;
+    };
+    if index == 0 {
+        choices.remove(slug);
+    } else {
+        choices.insert(slug.to_string(), core.id.to_string());
+    }
+    true
 }
 
 const NINTENDO: [&str; 11] = [
@@ -230,13 +328,14 @@ pub fn is_computer(core_id: &str) -> bool {
 
 // These draw through Vulkan where this computer has a working Vulkan device, which on
 // macOS is the bundled MoltenVK.
-const VULKAN_CORES: [(&str, &[(&str, &str)]); 6] = [
+const VULKAN_CORES: [(&str, &[(&str, &str)]); 7] = [
     ("dolphin", &[]),
     ("flycast", &[]),
     (
         "mednafen_psx_hw",
         &[("beetle_psx_hw_renderer", "hardware_vk")],
     ),
+    ("swanstation", &[("swanstation_GPU_Renderer", "Vulkan")]),
     (
         "mupen64plus_next",
         &[("mupen64plus-rdp-plugin", "parallel")],
@@ -319,6 +418,12 @@ pub fn default_options(core_id: &str) -> Vec<(String, String)> {
             ("puae_immediate_blits", "true"),
         ],
         "mednafen_psx_hw" => &[("beetle_psx_analog_toggle", "enabled")],
+        // Memory card 1 is the save RAM Romp syncs, as game.srm, like RetroArch's .srm. The
+        // DualShock, chosen per game in the game menu, toggles analog mode with L1 + R1 + Select.
+        "swanstation" => &[
+            ("swanstation_MemoryCards_Card1Type", "Libretro"),
+            ("swanstation_Controller_AnalogCombo", "3"),
+        ],
         "vice_x64sc" => &[("vice_drive_true_emulation", "disabled")],
         "nestopia" => &[("nestopia_zapper_device", "lightgun")],
         "pcsx2" => &[
@@ -619,6 +724,140 @@ mod tests {
         }
     }
 
+    fn ids(cores: Vec<&CoreInfo>) -> Vec<&str> {
+        cores.into_iter().map(|c| c.id).collect()
+    }
+
+    #[test]
+    fn systems_offer_their_default_first_then_the_alternatives() {
+        let psx = cores_for_platform("psx");
+        assert_eq!(psx[0], core_for_platform("psx").unwrap());
+        assert!(ids(psx).contains(&"swanstation"));
+        for slug in ["gb", "gbc"] {
+            assert!(
+                ids(cores_for_platform(slug)).contains(&"gambatte"),
+                "{slug}"
+            );
+        }
+        assert!(!ids(cores_for_platform("gba")).contains(&"gambatte"));
+        for slug in ["nes", "famicom", "fds"] {
+            assert!(ids(cores_for_platform(slug)).contains(&"mesen"), "{slug}");
+        }
+        assert_eq!(ids(cores_for_platform("snes")), ["snes9x"]);
+        assert!(cores_for_platform("xbox").is_empty());
+        for slug in ["psx", "gb", "gbc", "nes", "famicom", "fds"] {
+            let ids = ids(cores_for_platform(slug));
+            let mut unique = ids.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(ids.len(), unique.len(), "{slug} lists an emulator twice");
+        }
+    }
+
+    #[test]
+    fn alternative_cores_download_from_the_buildbot_under_their_own_names() {
+        for (id, lib) in [
+            ("swanstation", "swanstation_libretro"),
+            ("gambatte", "gambatte_libretro"),
+            ("mesen", "mesen_libretro"),
+        ] {
+            let core = all_cores().find(|c| c.id == id).unwrap();
+            assert_eq!(core.lib, lib);
+            assert!(!core.jit, "{id}");
+            assert_eq!(download_base(core), BUILDBOT);
+            assert!(buildbot_url(BUILDBOT, core).contains(&format!("/latest/{lib}.")));
+        }
+    }
+
+    #[test]
+    fn systems_without_a_choice_use_their_default() {
+        let none = CoreChoices::new();
+        for slug in ["psx", "gb", "nes", "snes", "ps2"] {
+            assert_eq!(core_for(slug, &none), core_for_platform(slug), "{slug}");
+        }
+        assert!(core_for("xbox", &none).is_none());
+    }
+
+    /// The first emulator a system offers besides its default, whatever the default is.
+    fn alternative(slug: &str) -> &'static CoreInfo {
+        let other = cores_for_platform(slug)[1];
+        assert_ne!(Some(other), core_for_platform(slug), "{slug}");
+        other
+    }
+
+    #[test]
+    fn a_chosen_core_replaces_the_default_for_its_system_only() {
+        let mut choices = CoreChoices::new();
+        let psx = alternative("psx");
+        assert!(choose_core(&mut choices, "psx", 1));
+        assert_eq!(choices.get("psx").map(String::as_str), Some(psx.id));
+        assert_eq!(core_for("psx", &choices), Some(psx));
+        assert_eq!(core_for("snes", &choices), core_for_platform("snes"));
+
+        let gb = alternative("gb");
+        assert!(choose_core(&mut choices, "gb", 1));
+        assert_eq!(core_for("gb", &choices), Some(gb));
+        assert_eq!(core_for("gbc", &choices), core_for_platform("gbc"));
+        assert_eq!(core_for("gba", &choices), core_for_platform("gba"));
+
+        let fds = alternative("fds");
+        let saved = choices_from_json(Some(&format!(r#"{{"fds":"{}"}}"#, fds.id)));
+        assert_eq!(core_for("fds", &saved), Some(fds));
+        assert_eq!(core_for("nes", &saved), core_for_platform("nes"));
+
+        assert!(choose_core(&mut choices, "psx", 0));
+        assert!(!choices.contains_key("psx"), "the default is not stored");
+        assert_eq!(core_for("psx", &choices), core_for_platform("psx"));
+    }
+
+    #[test]
+    fn unknown_or_stale_core_choices_fall_back_to_the_default() {
+        let mut choices = CoreChoices::new();
+        assert!(!choose_core(&mut choices, "psx", 99));
+        assert!(!choose_core(&mut choices, "xbox", 0));
+        assert!(choices.is_empty());
+        // A core this system can't use: a Game Boy emulator that doesn't play the GBA.
+        let gba = cores_for_platform("gba");
+        let gb_only = cores_for_platform("gb")
+            .into_iter()
+            .find(|c| !gba.contains(c))
+            .unwrap();
+        choices.insert("psx".into(), "no_such_core".into());
+        choices.insert("gba".into(), gb_only.id.into());
+        choices.insert("xbox".into(), alternative("psx").id.into());
+        assert_eq!(core_for("psx", &choices), core_for_platform("psx"));
+        assert_eq!(core_for("gba", &choices), core_for_platform("gba"));
+        assert!(core_for("xbox", &choices).is_none());
+        assert_eq!(choices_from_json(Some("not json")), CoreChoices::new());
+        assert_eq!(choices_from_json(None), CoreChoices::new());
+    }
+
+    #[test]
+    fn the_emulator_a_game_last_played_with_is_remembered_by_id() {
+        let other = alternative("psx");
+        assert_eq!(played_core("psx", Some(other.id)), Some(other));
+        assert_eq!(played_core("psx", None), earlier_default("psx"));
+        assert_eq!(played_core("psx", Some("gone")), earlier_default("psx"));
+        assert!(earlier_default("psx").is_some());
+    }
+
+    #[test]
+    fn swanstation_keeps_memory_card_1_in_save_ram() {
+        let options = default_options("swanstation");
+        assert!(options.contains(&(
+            "swanstation_MemoryCards_Card1Type".into(),
+            "Libretro".into()
+        )));
+        assert!(options.contains(&("swanstation_Controller_AnalogCombo".into(), "3".into())));
+        let renderer = options
+            .iter()
+            .find(|(k, _)| k == "swanstation_GPU_Renderer")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(renderer, crate::vulkan::available().then_some("Vulkan"));
+        assert!(default_options("gambatte").is_empty());
+        assert!(default_options("mesen").is_empty());
+    }
+
     #[test]
     fn cores_draw_with_vulkan_where_it_works() {
         let vulkan = crate::vulkan::available();
@@ -628,6 +867,7 @@ mod tests {
             "dolphin",
             "flycast",
             "mednafen_psx_hw",
+            "swanstation",
             "mupen64plus_next",
             "ppsspp",
             "pcsx2",

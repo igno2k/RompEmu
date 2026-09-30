@@ -53,6 +53,21 @@ static CORE_LICENSES: &[(&str, &str, &str)] = &[
         "https://github.com/libretro/snes9x/blob/master/LICENSE",
     ),
     (
+        "mesen",
+        "GPL-3.0",
+        "https://github.com/libretro/Mesen/blob/master/LICENSE",
+    ),
+    (
+        "gambatte",
+        "GPL-2.0",
+        "https://github.com/libretro/gambatte-libretro/blob/master/COPYING",
+    ),
+    (
+        "swanstation",
+        "GPL-3.0",
+        "https://github.com/libretro/swanstation/blob/main/LICENSE",
+    ),
+    (
         "nestopia",
         "GPL-2.0",
         "https://github.com/libretro/nestopia/blob/master/COPYING",

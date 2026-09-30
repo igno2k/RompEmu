@@ -79,7 +79,11 @@ Romp downloads the emulator for each system the first time you play one of its g
 | Microsoft Xbox | xemu |
 | ZX Spectrum | Fuse |
 
-All emulators except xemu are [libretro](https://www.libretro.com) cores. Dolphin, PPSSPP, Flycast, Beetle PSX HW, Mupen64Plus-Next and the PS2 emulators draw through Vulkan when the computer has a working Vulkan driver, and through OpenGL otherwise. On macOS, Vulkan comes from the bundled [MoltenVK](https://github.com/KhronosGroup/MoltenVK). Some systems need BIOS files, which Romp takes from your RomM server's firmware.
+In the Consoles tab of Settings you can choose another emulator for some systems: SwanStation for PlayStation, Gambatte for Game Boy and Game Boy Color, and Mesen for the NES, Famicom and Famicom Disk System.
+
+All emulators except xemu are [libretro](https://www.libretro.com) cores. Dolphin, PPSSPP, Flycast, Beetle PSX HW, SwanStation, Mupen64Plus-Next and the PS2 emulators draw through Vulkan when the computer has a working Vulkan driver, and through OpenGL otherwise. On macOS, Vulkan comes from the bundled [MoltenVK](https://github.com/KhronosGroup/MoltenVK). Some systems need BIOS files, which Romp takes from your RomM server's firmware.
+
+When a game starts with a different emulator than last time, the saves and save states the other one left are first synced under its name, then moved to a folder of their own in the game's backup folder, so the new emulator never loads or uploads them. Beetle PSX HW and SwanStation keep the same memory card file, so a PlayStation game keeps its in-game save between them and only the save states are set aside. If the other emulator's saves haven't synced yet and can't sync now, for example offline, the game doesn't start until they have, or until you choose that emulator again. If Romp can't read a game's save file or set it aside, in-game saving is off for that session and the game window says so. SwanStation keeps memory card 1 as the game's save, like RetroArch's .srm. Its controller is the digital pad unless you pick the DualShock for the game in the game menu, where L1 + R1 + Select toggles analog mode.
 
 ## Running
 

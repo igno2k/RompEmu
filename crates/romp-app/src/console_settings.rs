@@ -1,4 +1,6 @@
-use crate::cores::{core_for_platform, default_options, uses_vulkan};
+use crate::cores::{
+    choosable_platforms, core_for, cores_for_platform, default_options, uses_vulkan, CoreChoices,
+};
 use std::collections::BTreeMap;
 
 pub const STORE_KEY: &str = "console_settings";
@@ -161,6 +163,19 @@ static CONSOLES: &[Console] = &[
         }],
     },
     Console {
+        name: "PlayStation",
+        platform: "psx",
+        core: "swanstation",
+        vulkan: true,
+        settings: &[Setting {
+            key: "swanstation_GPU_ResolutionScale",
+            label: "Resolution",
+            detail: RESOLUTION_DETAIL,
+            choices: &[choice("Native", "1"), choice("2x", "2"), choice("4x", "4")],
+            default: 1,
+        }],
+    },
+    Console {
         name: "PSP",
         platform: "psp",
         core: "ppsspp",
@@ -197,12 +212,61 @@ static CONSOLES: &[Console] = &[
     },
 ];
 
-/// The consoles whose emulator on this computer has settings.
-pub fn consoles() -> impl Iterator<Item = &'static Console> {
-    CONSOLES.iter().filter(|c| {
-        core_for_platform(c.platform).is_some_and(|core| core.id == c.core)
-            && (!c.vulkan || uses_vulkan(c.core))
+fn applies(console: &Console) -> bool {
+    !console.vulkan || uses_vulkan(console.core)
+}
+
+/// The consoles whose emulator on this computer, as chosen, has settings.
+pub fn consoles(cores: &CoreChoices) -> impl Iterator<Item = &'static Console> + '_ {
+    CONSOLES.iter().filter(move |c| {
+        core_for(c.platform, cores).is_some_and(|core| core.id == c.core) && applies(c)
     })
+}
+
+/// Setting keys for a system's emulator start with this, followed by the platform slug.
+pub const EMULATOR_KEY: &str = "emulator:";
+
+const SYSTEM_NAMES: [(&str, &str); 6] = [
+    ("psx", "PlayStation"),
+    ("gb", "Game Boy"),
+    ("gbc", "Game Boy Color"),
+    ("nes", "NES"),
+    ("famicom", "Famicom"),
+    ("fds", "Famicom Disk System"),
+];
+
+pub struct EmulatorChoice {
+    pub key: String,
+    pub system: &'static str,
+    pub choices: Vec<&'static str>,
+    pub current: usize,
+}
+
+/// A row per system that can play with more than one emulator, listing them default first.
+pub fn emulator_choices(cores: &CoreChoices) -> Vec<EmulatorChoice> {
+    choosable_platforms()
+        .into_iter()
+        .map(|slug| {
+            let options = cores_for_platform(slug);
+            let current = core_for(slug, cores)
+                .and_then(|chosen| options.iter().position(|c| c.id == chosen.id))
+                .unwrap_or(0);
+            EmulatorChoice {
+                key: format!("{EMULATOR_KEY}{slug}"),
+                system: SYSTEM_NAMES
+                    .iter()
+                    .find(|(s, _)| *s == slug)
+                    .map_or(slug, |(_, name)| name),
+                choices: options.iter().map(|c| c.name).collect(),
+                current,
+            }
+        })
+        .collect()
+}
+
+/// The platform slug an emulator setting key is for.
+pub fn emulator_platform(key: &str) -> Option<&str> {
+    key.strip_prefix(EMULATOR_KEY)
 }
 
 pub type Chosen = BTreeMap<String, String>;
@@ -238,8 +302,9 @@ pub fn choose(chosen: &mut Chosen, key: &str, index: usize) -> bool {
 /// The core options a game starts with: the core's own defaults, then its console settings.
 pub fn core_options(core_id: &str, chosen: &Chosen) -> Vec<(String, String)> {
     let mut options = default_options(core_id);
-    for setting in consoles()
-        .filter(|c| c.core == core_id)
+    for setting in CONSOLES
+        .iter()
+        .filter(|c| c.core == core_id && applies(c))
         .flat_map(|c| c.settings)
     {
         let value = setting.choices[selected(setting, chosen)].value.to_string();
@@ -311,7 +376,7 @@ mod tests {
 
     #[test]
     fn vulkan_settings_only_show_where_the_emulator_uses_vulkan() {
-        let listed: Vec<_> = consoles().map(|c| c.core).collect();
+        let listed: Vec<_> = consoles(&CoreChoices::new()).map(|c| c.core).collect();
         assert_eq!(listed.contains(&"dolphin"), cfg!(target_os = "macos"));
         assert_eq!(
             listed.contains(&"mupen64plus_next"),
@@ -325,7 +390,7 @@ mod tests {
     }
 
     fn ps2() -> Option<&'static Console> {
-        consoles().find(|c| c.platform == "ps2")
+        consoles(&CoreChoices::new()).find(|c| c.platform == "ps2")
     }
 
     #[test]
@@ -367,16 +432,77 @@ mod tests {
 
     #[test]
     fn only_the_emulators_this_computer_uses_are_listed() {
-        for console in consoles() {
+        for console in consoles(&CoreChoices::new()) {
             assert_eq!(
-                core_for_platform(console.platform).unwrap().id,
+                crate::cores::core_for_platform(console.platform)
+                    .unwrap()
+                    .id,
                 console.core
             );
         }
         assert_eq!(
-            consoles().filter(|c| c.platform == "ps2").count(),
+            consoles(&CoreChoices::new())
+                .filter(|c| c.platform == "ps2")
+                .count(),
             1,
             "one PS2 emulator per computer"
         );
+    }
+
+    #[test]
+    fn the_chosen_emulator_brings_its_own_settings() {
+        let mut cores = CoreChoices::new();
+        let psx = |cores: &CoreChoices| -> Vec<&str> {
+            consoles(cores)
+                .filter(|c| c.platform == "psx")
+                .map(|c| c.core)
+                .collect()
+        };
+        let default = crate::cores::core_for_platform("psx").unwrap().id;
+        let other = cores_for_platform("psx")
+            .into_iter()
+            .find(|c| c.id != default)
+            .unwrap()
+            .id;
+        cores.insert("psx".into(), other.into());
+        let listed = psx(&cores);
+        assert!(!listed.contains(&default));
+        assert_eq!(listed.contains(&other), uses_vulkan(other));
+        assert!(psx(&CoreChoices::new()).iter().all(|c| *c == default));
+
+        let swanstation = core_options("swanstation", &Chosen::new());
+        let scale = swanstation
+            .iter()
+            .find(|(k, _)| k == "swanstation_GPU_ResolutionScale")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(scale, uses_vulkan("swanstation").then_some("2"));
+        assert!(swanstation.contains(&(
+            "swanstation_MemoryCards_Card1Type".into(),
+            "Libretro".into()
+        )));
+    }
+
+    #[test]
+    fn every_system_with_a_choice_of_emulators_is_named_and_shows_its_choice() {
+        let rows = emulator_choices(&CoreChoices::new());
+        assert_eq!(rows.len(), choosable_platforms().len());
+        for row in &rows {
+            let slug = emulator_platform(&row.key).unwrap();
+            assert!(
+                SYSTEM_NAMES.iter().any(|(s, _)| *s == slug),
+                "{slug} has no name"
+            );
+            assert!(row.choices.len() > 1, "{slug}");
+            assert_eq!(row.current, 0, "{slug} starts on its default");
+        }
+        let mut cores = CoreChoices::new();
+        assert!(crate::cores::choose_core(&mut cores, "gb", 1));
+        let gb = emulator_choices(&cores)
+            .into_iter()
+            .find(|r| r.key == "emulator:gb")
+            .unwrap();
+        assert_eq!(gb.current, 1);
+        assert_eq!(gb.system, "Game Boy");
+        assert_eq!(emulator_platform("armsx2_upscale"), None);
     }
 }
