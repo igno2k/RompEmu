@@ -34,7 +34,7 @@ static CORES: &[(&[&str], CoreInfo)] = &[
     ),
     (
         &["nes", "famicom", "fds"],
-        core("nestopia", "Nestopia UE", "nestopia_libretro", false),
+        core("mesen", "Mesen", "mesen_libretro", false),
     ),
     (
         &["genesis", "sms", "gamegear", "segacd", "sg1000"],
@@ -46,9 +46,10 @@ static CORES: &[(&[&str], CoreInfo)] = &[
         ),
     ),
     (
-        &["gb", "gbc", "gba"],
-        core("mgba", "mGBA", "mgba_libretro", false),
+        &["gb", "gbc"],
+        core("gambatte", "Gambatte", "gambatte_libretro", false),
     ),
+    (&["gba"], core("mgba", "mGBA", "mgba_libretro", false)),
     (
         &["dc"],
         core("flycast", "Flycast", "flycast_libretro", true),
@@ -86,12 +87,7 @@ static CORES: &[(&[&str], CoreInfo)] = &[
     ),
     (
         &["psx"],
-        core(
-            "mednafen_psx_hw",
-            "Beetle PSX HW",
-            "mednafen_psx_hw_libretro",
-            false,
-        ),
+        core("swanstation", "SwanStation", "swanstation_libretro", false),
     ),
     (
         &["saturn"],
@@ -199,15 +195,17 @@ static CORES: &[(&[&str], CoreInfo)] = &[
 static ALTERNATIVES: &[(&[&str], CoreInfo)] = &[
     (
         &["psx"],
-        core("swanstation", "SwanStation", "swanstation_libretro", false),
+        core(
+            "mednafen_psx_hw",
+            "Beetle PSX HW",
+            "mednafen_psx_hw_libretro",
+            false,
+        ),
     ),
-    (
-        &["gb", "gbc"],
-        core("gambatte", "Gambatte", "gambatte_libretro", false),
-    ),
+    (&["gb", "gbc"], core("mgba", "mGBA", "mgba_libretro", false)),
     (
         &["nes", "famicom", "fds"],
-        core("mesen", "Mesen", "mesen_libretro", false),
+        core("nestopia", "Nestopia UE", "nestopia_libretro", false),
     ),
 ];
 
@@ -272,9 +270,18 @@ pub fn core_for(slug: &str, choices: &CoreChoices) -> Option<&'static CoreInfo> 
         .or_else(|| core_for_platform(slug))
 }
 
-/// The emulator games of a system played with before Romp remembered each game's emulator.
+/// The emulator games of a system played with before Romp remembered each game's emulator:
+/// upstream Romp's default, from before these systems moved to RetroDECK's emulators.
 fn earlier_default(slug: &str) -> Option<&'static CoreInfo> {
-    core_for_platform(slug)
+    let earlier = match slug {
+        "psx" => "mednafen_psx_hw",
+        "gb" | "gbc" => "mgba",
+        "nes" | "famicom" | "fds" => "nestopia",
+        _ => return core_for_platform(slug),
+    };
+    cores_for_platform(slug)
+        .into_iter()
+        .find(|c| c.id == earlier)
 }
 
 /// The emulator a game was last played with, from the id Romp remembered for it. Games from
@@ -706,8 +713,29 @@ mod tests {
         assert_eq!(core_for_platform("snes").unwrap().id, "snes9x");
         assert_eq!(
             core_for_platform("psx").unwrap().lib,
-            "mednafen_psx_hw_libretro"
+            "swanstation_libretro"
         );
+        for slug in ["gb", "gbc"] {
+            assert_eq!(core_for_platform(slug).unwrap().id, "gambatte");
+        }
+        assert_eq!(core_for_platform("gba").unwrap().id, "mgba");
+        for slug in ["nes", "famicom", "fds"] {
+            assert_eq!(core_for_platform(slug).unwrap().id, "mesen");
+        }
+        let ids = |slug| -> Vec<&str> { cores_for_platform(slug).iter().map(|c| c.id).collect() };
+        assert_eq!(ids("psx"), ["swanstation", "mednafen_psx_hw"]);
+        assert_eq!(ids("gb"), ["gambatte", "mgba"]);
+        assert_eq!(ids("gba"), ["mgba"]);
+        assert_eq!(ids("fds"), ["mesen", "nestopia"]);
+        // Games played before Romp remembered their emulator used upstream's default.
+        for (slug, earlier) in [
+            ("psx", "mednafen_psx_hw"),
+            ("gbc", "mgba"),
+            ("famicom", "nestopia"),
+        ] {
+            assert_eq!(played_core(slug, None).unwrap().id, earlier);
+        }
+        assert_eq!(played_core("snes", None), core_for_platform("snes"));
         assert!(core_for_platform("dc").unwrap().jit);
         assert!(core_for_platform("xbox").is_none());
         for slug in ["ngc", "wii"] {

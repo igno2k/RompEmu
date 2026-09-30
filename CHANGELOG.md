@@ -6,10 +6,11 @@ All notable changes to Romp are listed here. The format follows [Keep a Changelo
 
 ### Added
 
-- A choice of emulator for some systems in the Consoles tab of Settings: SwanStation for PlayStation, Gambatte for Game Boy and Game Boy Color, and Mesen for the NES, Famicom and Famicom Disk System. In-game saves sync under the chosen emulator's name, and SwanStation keeps memory card 1 as the game's save, like RetroArch.
+- A choice of emulator for PlayStation, Game Boy, Game Boy Color, NES, Famicom and Famicom Disk System games in the Consoles tab of Settings. In-game saves sync under the chosen emulator's name, and SwanStation keeps memory card 1 as the game's save, like RetroArch.
 
 ### Changed
 
+- PlayStation games play with SwanStation, Game Boy and Game Boy Color games with Gambatte, and NES, Famicom and Famicom Disk System games with Mesen, the emulators RetroDECK uses, so in-game saves move between the two. Beetle PSX HW, mGBA and Nestopia UE stay available in the Consoles tab of Settings.
 - On Windows and Linux, GameCube, Wii, PSP, Dreamcast, PlayStation, N64 and PS2 games draw through Vulkan when the computer has a working Vulkan driver, and through OpenGL otherwise. N64 gets the accurate paraLLEl-RDP renderer, and the resolution settings in the Consoles tab.
 
 ### Fixed

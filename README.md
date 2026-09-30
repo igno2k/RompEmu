@@ -58,10 +58,11 @@ Romp downloads the emulator for each system the first time you play one of its g
 | NEC PC Engine / TurboGrafx-16 | Beetle PCE Fast |
 | NEC PC Engine CD / TurboGrafx-CD | Beetle PCE |
 | NEC SuperGrafx | Beetle SuperGrafx |
-| Nintendo Entertainment System, Famicom and Famicom Disk System | Nestopia UE |
+| Nintendo Entertainment System, Famicom and Famicom Disk System | Mesen |
 | Super Nintendo and Super Famicom | Snes9x |
 | Nintendo 64 | Mupen64Plus-Next |
-| Game Boy, Game Boy Color and Game Boy Advance | mGBA |
+| Game Boy and Game Boy Color | Gambatte |
+| Game Boy Advance | mGBA |
 | Nintendo DS | DeSmuME |
 | Nintendo GameCube and Wii | Dolphin |
 | Nintendo Virtual Boy | Beetle VB |
@@ -72,14 +73,14 @@ Romp downloads the emulator for each system the first time you play one of its g
 | Sega Saturn | Beetle Saturn |
 | Sega Dreamcast | Flycast |
 | SNK Neo Geo Pocket and Pocket Color | Beetle NeoPop |
-| Sony PlayStation | Beetle PSX HW |
+| Sony PlayStation | SwanStation |
 | Sony PlayStation 2 | PCSX2 on Windows and Linux, [ARMSX2](https://github.com/RompEmu/ARMSX2) on macOS |
 | Sony PSP | PPSSPP |
 | Vectrex | Vecx |
 | Microsoft Xbox | xemu |
 | ZX Spectrum | Fuse |
 
-In the Consoles tab of Settings you can choose another emulator for some systems: SwanStation for PlayStation, Gambatte for Game Boy and Game Boy Color, and Mesen for the NES, Famicom and Famicom Disk System.
+In the Consoles tab of Settings you can choose another emulator for some systems: Beetle PSX HW for PlayStation, mGBA for Game Boy and Game Boy Color, and Nestopia UE for the NES, Famicom and Famicom Disk System.
 
 All emulators except xemu are [libretro](https://www.libretro.com) cores. Dolphin, PPSSPP, Flycast, Beetle PSX HW, SwanStation, Mupen64Plus-Next and the PS2 emulators draw through Vulkan when the computer has a working Vulkan driver, and through OpenGL otherwise. On macOS, Vulkan comes from the bundled [MoltenVK](https://github.com/KhronosGroup/MoltenVK). Some systems need BIOS files, which Romp takes from your RomM server's firmware.
 
