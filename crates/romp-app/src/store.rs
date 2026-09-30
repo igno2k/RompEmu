@@ -40,6 +40,8 @@ pub struct GameDetail {
     pub local_path: Option<String>,
     pub meta: RomMetadata,
     pub screenshots: Vec<String>,
+    /// RomM's name for the game's saves, such as a PS2 serial.
+    pub save_target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +185,15 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 6 {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE games ADD COLUMN save_target TEXT;
+                 DELETE FROM kv WHERE key = 'last_sync_at';
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -228,14 +239,15 @@ impl Store {
             tx.execute(
                 "INSERT INTO games
                  (id, platform_id, title, summary, updated_at, cover_small, cover_large, size_bytes,
-                  meta, screenshots, added_at, last_played)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                  meta, screenshots, added_at, last_played, save_target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
                    platform_id = excluded.platform_id, title = excluded.title,
                    summary = excluded.summary, updated_at = excluded.updated_at,
                    cover_small = excluded.cover_small, cover_large = excluded.cover_large,
                    size_bytes = excluded.size_bytes, meta = excluded.meta,
                    screenshots = excluded.screenshots, added_at = excluded.added_at,
+                   save_target = excluded.save_target,
                    last_played = NULLIF(MAX(COALESCE(last_played, 0),
                                             COALESCE(excluded.last_played, 0)), 0)",
                 params![
@@ -252,7 +264,8 @@ impl Store {
                         .and_then(|m| serde_json::to_string(m).ok()),
                     serde_json::to_string(&r.merged_screenshots).ok(),
                     r.added_at(),
-                    r.last_played()
+                    r.last_played(),
+                    non_empty(&r.save_target)
                 ],
             )
             .expect("upsert game");
@@ -425,7 +438,7 @@ impl Store {
             .query_row(
                 "SELECT g.id, g.title, g.platform_id, COALESCE(p.slug, ''), COALESCE(p.name, ''),
                         g.summary, g.size_bytes, g.cover_small, g.cover_large, g.local_path,
-                        p.category, g.meta, g.screenshots
+                        p.category, g.meta, g.screenshots, g.save_target
                  FROM games g LEFT JOIN platforms p ON p.id = g.platform_id WHERE g.id = ?1",
                 [id],
                 |r| {
@@ -443,6 +456,7 @@ impl Store {
                         platform_category: r.get(10)?,
                         meta: json_column(r.get(11)?),
                         screenshots: json_column(r.get(12)?),
+                        save_target: r.get(13)?,
                     })
                 },
             )
@@ -955,6 +969,7 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE games DROP COLUMN meta; ALTER TABLE games DROP COLUMN screenshots;
                      ALTER TABLE games DROP COLUMN added_at; ALTER TABLE games DROP COLUMN last_played;
+                     ALTER TABLE games DROP COLUMN save_target;
                      ALTER TABLE platforms DROP COLUMN category; PRAGMA user_version = 2;",
                 )
                 .unwrap();
@@ -966,6 +981,33 @@ mod tests {
         assert_eq!(
             Store::open(&path).unwrap().get("last_sync_at").as_deref(),
             Some("u")
+        );
+    }
+
+    #[test]
+    fn v5_database_learns_what_names_each_games_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        {
+            let mut s = Store::open(&path).unwrap();
+            s.upsert_games(&[rom(1, 1, "Futurama", "t")]);
+            s.set("last_sync_at", "t");
+            s.conn
+                .execute_batch(
+                    "ALTER TABLE games DROP COLUMN save_target; PRAGMA user_version = 5;",
+                )
+                .unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        // Forgetting the sync cursor fetches every game again, with its save target.
+        assert_eq!(s.get("last_sync_at"), None);
+        assert_eq!(s.game(1).unwrap().save_target, None);
+        let mut futurama = rom(1, 1, "Futurama", "t");
+        futurama.save_target = Some("BASLUS-20439".into());
+        s.upsert_games(&[futurama]);
+        assert_eq!(
+            s.game(1).unwrap().save_target.as_deref(),
+            Some("BASLUS-20439")
         );
     }
 

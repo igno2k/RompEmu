@@ -27,6 +27,7 @@ mod play;
 mod players;
 mod ports;
 mod prefs;
+mod ps2;
 mod qr;
 mod restore;
 mod romm;

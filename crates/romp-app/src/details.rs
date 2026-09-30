@@ -171,6 +171,7 @@ mod tests {
             local_path: None,
             meta,
             screenshots: Vec::new(),
+            save_target: None,
         }
     }
 

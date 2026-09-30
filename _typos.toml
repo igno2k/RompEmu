@@ -2,6 +2,8 @@
 sav = "sav"
 typ = "typ"
 UE = "UE"
+# The PS2 memory card region prefix for America, as in BASLUS-20152.
+BA = "BA"
 
 [files]
 extend-exclude = ["*.png", "*.ico", "LICENSE"]

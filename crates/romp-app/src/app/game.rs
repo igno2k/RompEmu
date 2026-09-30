@@ -573,6 +573,15 @@ impl Controller {
                     });
                     return;
                 }
+                // Even offline, so ARMSX2 finds a folder memory card and never makes an image.
+                if let Err(e) = saves::prepare_in_game_save(&game) {
+                    tracing::warn!("preparing {id}'s memory card: {e}");
+                    on_ui(move |c| {
+                        c.preparing.set(false);
+                        c.game_status(id, format!("Couldn't get the memory card ready: {e}."));
+                    });
+                    return;
+                }
             }
             let sram = match (&client, device) {
                 (Some(client), Some(device)) => {

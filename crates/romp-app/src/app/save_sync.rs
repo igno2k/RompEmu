@@ -37,6 +37,14 @@ pub(super) fn conflict_text(conflict: &SramConflict) -> String {
     )
 }
 
+/// Points a PS2 game's saves at the libretro system folder, where the emulator's own GameDB
+/// is, when one is installed.
+fn with_system_dir(saves: &mut GameSaves) {
+    if let Some(ps2) = saves.ps2.as_mut() {
+        ps2.system_dir = Some(paths::system_dir());
+    }
+}
+
 fn version_key(rom_id: i64) -> String {
     format!("core_version:{rom_id}")
 }
@@ -180,7 +188,7 @@ impl Controller {
 
     /// How a game starts with the emulator chosen for its system, and the saves it syncs.
     pub(super) fn plan_launch(&self, detail: &GameDetail) -> Option<saves::Launch> {
-        saves::plan_launch(
+        let mut launch = saves::plan_launch(
             &detail.platform_slug,
             &self.core_choices(),
             self.last_core(detail.id).as_deref(),
@@ -188,17 +196,23 @@ impl Controller {
             paths::game_save_dir(&paths::data_dir(), &self.server(), detail.id),
             &detail.title,
             detail.local_path.as_deref().map(std::path::Path::new),
-        )
+            detail.save_target.as_deref(),
+        )?;
+        with_system_dir(&mut launch.saves);
+        Some(launch)
     }
 
     pub(super) fn saves_with(&self, core: &CoreInfo, detail: &GameDetail) -> GameSaves {
-        saves::game_saves(
+        let mut saves = saves::game_saves(
             core,
             detail.id,
             paths::game_save_dir(&paths::data_dir(), &self.server(), detail.id),
             &detail.title,
             detail.local_path.as_deref().map(std::path::Path::new),
-        )
+            detail.save_target.as_deref(),
+        );
+        with_system_dir(&mut saves);
+        saves
     }
 
     /// The saves in a game's folder, as the emulator it was last played with syncs them, so
@@ -382,8 +396,8 @@ mod tests {
             store.add_pending(5);
         }
         Switch {
-            old: saves::game_saves(core(from), 5, dir.path().into(), "Game", None),
-            new: saves::game_saves(core(to), 5, dir.path().into(), "Game", None),
+            old: saves::game_saves(core(from), 5, dir.path().into(), "Game", None, None),
+            new: saves::game_saves(core(to), 5, dir.path().into(), "Game", None, None),
             store: Mutex::new(store),
             dir,
         }

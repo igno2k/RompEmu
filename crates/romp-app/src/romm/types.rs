@@ -124,6 +124,10 @@ pub struct Rom {
     pub created_at: Option<String>,
     #[serde(default)]
     pub rom_user: Option<RomUser>,
+    /// What names the game's saves in a folder other games write to as well, such as a PS2
+    /// serial, as RomM's scan read it out of the game. Absent from servers before RomM 5.3.
+    #[serde(default)]
+    pub save_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -204,6 +208,9 @@ pub struct SyncOp {
     pub file_name: String,
     pub server_updated_at: Option<String>,
     pub server_content_hash: Option<String>,
+    /// The emulator the server's save was uploaded under.
+    #[serde(default)]
+    pub emulator: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -220,6 +227,8 @@ pub struct RemoteSave {
     pub slot: Option<String>,
     pub updated_at: String,
     pub content_hash: Option<String>,
+    #[serde(default)]
+    pub emulator: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -248,6 +257,7 @@ pub(crate) fn rom(id: i64, platform_id: i64, name: &str, updated_at: &str) -> Ro
         merged_screenshots: Vec::new(),
         created_at: None,
         rom_user: None,
+        save_target: None,
     }
 }
 
@@ -300,6 +310,25 @@ mod tests {
         .unwrap();
         assert_eq!(bare.added_at(), None);
         assert_eq!(bare.last_played(), None);
+    }
+
+    #[test]
+    fn a_rom_carries_what_names_its_saves() {
+        let rom: Rom = serde_json::from_value(serde_json::json!({
+            "id": 1, "platform_id": 2, "name": "Futurama", "fs_name": "Futurama (USA).chd",
+            "summary": null, "updated_at": "t", "path_cover_small": null,
+            "path_cover_large": null, "fs_size_bytes": 5, "save_target": "BASLUS-20439",
+            "save_target_layout": "folder-prefix"
+        }))
+        .unwrap();
+        assert_eq!(rom.save_target.as_deref(), Some("BASLUS-20439"));
+        let op: SyncOp = serde_json::from_value(serde_json::json!({
+            "action": "download", "rom_id": 1, "save_id": 2, "file_name": "f.zip",
+            "slot": "autosave", "server_updated_at": null, "server_content_hash": null,
+            "emulator": "armsx2"
+        }))
+        .unwrap();
+        assert_eq!(op.emulator.as_deref(), Some("armsx2"));
     }
 
     #[test]

@@ -7,14 +7,17 @@ All notable changes to Romp are listed here. The format follows [Keep a Changelo
 ### Added
 
 - A choice of emulator for PlayStation, Game Boy, Game Boy Color, NES, Famicom and Famicom Disk System games in the Consoles tab of Settings. In-game saves sync under the chosen emulator's name, and SwanStation keeps memory card 1 as the game's save, like RetroArch.
+- PS2 saves sync as a zip of the game's own save folders, the format Argosy and other RomM clients use, so a PS2 save moves between Romp and those clients. Downloads saved by Argosy's ARMSX2, NetherSX2 and AetherSX2 are accepted too.
 
 ### Changed
 
+- On a Mac, each PS2 game keeps its saves on a PCSX2 folder memory card. A memory card image from an earlier Romp is converted once, and kept in the game's backup folder.
 - PlayStation games play with SwanStation, Game Boy and Game Boy Color games with Gambatte, and NES, Famicom and Famicom Disk System games with Mesen, the emulators RetroDECK uses, so in-game saves move between the two. Beetle PSX HW, mGBA and Nestopia UE stay available in the Consoles tab of Settings.
 - On Windows and Linux, GameCube, Wii, PSP, Dreamcast, PlayStation, N64 and PS2 games draw through Vulkan when the computer has a working Vulkan driver, and through OpenGL otherwise. N64 gets the accurate paraLLEl-RDP renderer, and the resolution settings in the Consoles tab.
 
 ### Fixed
 
+- A PS2 save zip on the server is no longer written over a game's memory card, and a memory card is no longer uploaded where RomM's other clients expect a zip. A save Romp can't use is left alone, with the reason on the game page.
 - A save file of the wrong size for the emulator, such as one from another emulator, is moved to the game's backup folder instead of being overwritten.
 - When a game starts with a different emulator than last time, the other one's saves and save states are synced under its name and set aside, never loaded or uploaded by the new one. Between Beetle PSX HW and SwanStation, which share the memory card format, the in-game save stays. A game whose last emulator's saves can't sync first doesn't switch.
 

@@ -20,6 +20,9 @@ pub enum Error {
     Conflict,
     #[error("cancelled")]
     Cancelled,
+    /// A save Romp won't sync as it is, with the reason to show.
+    #[error("{0}")]
+    Refused(String),
 }
 
 pub fn server_candidates(input: &str) -> Result<Vec<Url>, String> {

@@ -105,6 +105,8 @@ Open a game from your library to download and play it. Romp installs the emulato
 
 In-game saves and save states sync with RomM before and after you play, so you can continue on another device. If a save changed in both places, Romp asks which to keep and backs up the other.
 
+PS2 saves sync the way RomM's other clients, such as Argosy, share them: as a zip of the game's own save folders from the memory card (`BASLUS-20439Futurama/…`), named after the game file and tagged `pcsx2`. Which folders are the game's comes from the serial RomM read out of the game, and from PCSX2's GameDB for games that also read another game's saves; the console's own folders, such as `BADATA-SYSTEM`, are never part of a game's save. ARMSX2 on a Mac keeps each game's saves on a PCSX2 folder memory card, and PCSX2 on Windows and Linux on a memory card image, which Romp reads the folders from and writes them into. A game RomM has no serial for, or a server save that isn't a PS2 save of that game, doesn't sync, and the game page says why. Before a download replaces a game's folders they are backed up, and a Mac's memory card image from an earlier Romp is turned into a folder card once, with the image kept in the game's backup folder.
+
 ## Controls
 
 - Gamepads are picked up automatically: the first one joins the keyboard as player 1, and each new one becomes the next player.
