@@ -92,20 +92,28 @@ pub fn is_card_file(name: &str) -> bool {
 }
 
 /// The folders one game owns on a card.
+///
+/// A game's own folders are the ones of its own serial, and a pull replaces them. The folders
+/// its `memcardFilters` add are shared: another game's saves this one reads, such as Gran
+/// Turismo 3's under Gran Turismo 4. They travel with the game's save, but a pull only writes
+/// one where the card has none, and never replaces or removes one, since the other game may
+/// have saved it since.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitRule {
     key: String,
-    stems: Vec<String>,
+    own: Vec<String>,
+    shared: Vec<String>,
 }
 
 impl UnitRule {
     /// The rule for the game RomM names `save_target`, widened by the `memcardFilters` the
     /// GameDB lists for its serial. None where the key is not a PS2 serial.
     pub fn new(save_target: &str, gamedb: &GameDb) -> Option<Self> {
-        let mut all = stems(save_target);
-        if all.is_empty() {
+        let own = stems(save_target);
+        if own.is_empty() {
             return None;
         }
+        let mut shared: Vec<String> = Vec::new();
         if let Some(serial) = bare_serial(save_target) {
             for filter in gamedb.filters(&serial) {
                 let mut extra = stems(filter);
@@ -116,15 +124,16 @@ impl UnitRule {
                     extra.push(literal);
                 }
                 for stem in extra {
-                    if !all.contains(&stem) {
-                        all.push(stem);
+                    if !own.contains(&stem) && !shared.contains(&stem) {
+                        shared.push(stem);
                     }
                 }
             }
         }
         Some(UnitRule {
             key: save_target.trim().to_string(),
-            stems: all,
+            own,
+            shared,
         })
     }
 
@@ -132,13 +141,22 @@ impl UnitRule {
         &self.key
     }
 
-    /// Whether a folder on the card is this game's.
-    pub fn owns(&self, name: &str) -> bool {
+    fn matches(stems: &[String], name: &str) -> bool {
         if is_card_file(name) || is_system_folder(name) {
             return false;
         }
         let n = normalize(name);
-        self.stems.iter().any(|stem| n.starts_with(stem.as_str()))
+        stems.iter().any(|stem| n.starts_with(stem.as_str()))
+    }
+
+    /// Whether a folder on the card goes with this game's save: its own, or shared.
+    pub fn owns(&self, name: &str) -> bool {
+        self.is_own(name) || Self::matches(&self.shared, name)
+    }
+
+    /// Whether a folder is one of this game's own, which a pull replaces.
+    pub fn is_own(&self, name: &str) -> bool {
+        Self::matches(&self.own, name)
     }
 }
 
@@ -206,7 +224,12 @@ mod tests {
         );
         let rule = UnitRule::new("BASCUS-97328", &db).unwrap();
         assert!(rule.owns("BASCUS-97328GT4"));
+        assert!(rule.is_own("BASCUS-97328GT4"));
         assert!(rule.owns("BASCUS-97102GT3"));
+        assert!(
+            !rule.is_own("BASCUS-97102GT3"),
+            "GT3's saves are shared, not GT4's own"
+        );
         assert!(!rule.owns("BASCUS-97103"));
         let db = GameDb::parse(
             "SLPM-65286:\n  memcardFilters:\n    - \"BISLPM-65286NET\"\n    - \"BWNETCNF\"\n",

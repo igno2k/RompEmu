@@ -30,6 +30,7 @@ pub mod archive;
 pub mod card;
 pub mod folder;
 pub mod gamedb;
+pub mod meta;
 pub mod rule;
 
 pub use gamedb::GameDb;
@@ -71,9 +72,9 @@ pub enum Layout {
 /// The game's folders in a save downloaded from RomM: a PS2 save zip, or a memory card image
 /// as Romp uploaded before it synced folders, from which only the game's folders are taken.
 /// Anything else, or a save holding none of the game's folders, is refused with the reason.
-pub fn decode(bytes: &[u8], rule: &UnitRule) -> Result<Unit, String> {
-    let unit = if archive::is_zip(bytes) {
-        let (unit, left_out) = archive::read(bytes, rule)?;
+pub fn decode(bytes: &[u8], rule: &UnitRule) -> Result<archive::Download, String> {
+    let download = if archive::is_zip(bytes) {
+        let (download, left_out) = archive::read(bytes, rule)?;
         if !left_out.is_empty() {
             tracing::info!(
                 "left out of {}'s PS2 save zip, not its own: {}",
@@ -81,22 +82,27 @@ pub fn decode(bytes: &[u8], rule: &UnitRule) -> Result<Unit, String> {
                 left_out.join(", ")
             );
         }
-        unit
+        download
     } else if bytes.starts_with(card::MAGIC) {
-        card::read_unit(bytes, &|n| rule.owns(n))
-            .map_err(|e| format!("the server's memory card can't be read: {e}"))?
+        let unit = card::read_unit(bytes, &|n| rule.owns(n))
+            .map_err(|e| format!("the server's memory card can't be read: {e}"))?;
+        archive::Download {
+            unit,
+            ..Default::default()
+        }
     } else {
         return Err(
             "the server's save for this game is neither a PS2 save zip nor a memory card".into(),
         );
     };
-    if unit.is_empty() {
+    // Shared folders alone are another game's saves, not this one's.
+    if !download.unit.keys().any(|n| rule.is_own(n)) {
         return Err(format!(
             "the server's save holds no save folders for {}",
             rule.key()
         ));
     }
-    Ok(unit)
+    Ok(download)
 }
 
 #[cfg(test)]
@@ -130,7 +136,9 @@ mod tests {
     fn a_zip_and_an_old_card_upload_both_give_the_games_folders() {
         let unit = futurama_like();
         assert_eq!(
-            decode(&archive::build(&unit).unwrap(), &rule()).unwrap(),
+            decode(&archive::build(&unit).unwrap(), &rule())
+                .unwrap()
+                .unit,
             unit
         );
         let mut with_another = unit.clone();
@@ -138,8 +146,16 @@ mod tests {
             "BASLUS-21693XX".into(),
             Files::from([("a".into(), b"b".to_vec())]),
         );
-        let image = card::apply_unit(None, &with_another, &|_| true, card::tod(0)).unwrap();
-        assert_eq!(decode(&image, &rule()).unwrap(), unit);
+        let image = card::image_of(&with_another, card::tod(0));
+        assert_eq!(decode(&image, &rule()).unwrap().unit, unit);
+    }
+
+    #[test]
+    fn another_games_shared_folders_alone_are_not_this_games_save() {
+        let gt4 = card::tests::gt4();
+        let only_gt3 = foreign_zip(&[("BASCUS-97102GT3/garage", b"GT3's")]);
+        let err = decode(&only_gt3, &gt4).unwrap_err();
+        assert!(err.contains("no save folders"), "{err}");
     }
 
     #[test]

@@ -447,7 +447,9 @@ impl GameSaves {
                         path.display()
                     )));
                 }
-                ps2::folder::read_folders(&path, &owns).map_err(Error::Refused)?
+                // Freshness is the game's own saves': a shared folder is another game's.
+                ps2::folder::read_folders(&path, &owns, &|n| rule.is_own(n))
+                    .map_err(Error::Refused)?
             }
             ps2::Layout::Image => {
                 let Ok(bytes) = std::fs::read(&path) else {
@@ -469,7 +471,8 @@ impl GameSaves {
                 (unit, changed)
             }
         };
-        if unit.is_empty() {
+        // Shared folders alone are another game's saves, nothing of this one's to send.
+        if !unit.keys().any(|n| rule.is_own(n)) {
             return Ok(None);
         }
         Ok(Some(LocalSave {
@@ -585,7 +588,7 @@ fn install_download(
         )));
     }
     let rule = ps2.rule()?;
-    let unit = ps2::decode(bytes, &rule).map_err(Error::Refused)?;
+    let download = ps2::decode(bytes, &rule).map_err(Error::Refused)?;
     let path = game.sram_path();
     match ps2.layout {
         ps2::Layout::Folder => {
@@ -600,7 +603,7 @@ fn install_download(
                 Ok(dir)
             };
             let removed =
-                ps2::folder::apply(&path, &unit, &rule, &mut backup).map_err(Error::Refused)?;
+                ps2::folder::apply(&path, &download, &rule, &mut backup).map_err(Error::Refused)?;
             if !removed.is_empty() {
                 tracing::info!(
                     "game {}: removed save folders the server's save no longer has: {}",
@@ -622,16 +625,19 @@ fn install_download(
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as i64);
-            let owns = |name: &str| rule.owns(name);
-            let image =
-                ps2::card::apply_unit(original.as_deref(), &unit, &owns, ps2::card::tod(now))
-                    .map_err(|e| {
-                        Error::Refused(format!(
-                            "the save could not be written into the memory card {}, which was \
+            let image = ps2::card::apply_unit(
+                original.as_deref(),
+                &download.unit,
+                &rule,
+                ps2::card::tod(now),
+            )
+            .map_err(|e| {
+                Error::Refused(format!(
+                    "the save could not be written into the memory card {}, which was \
                          left as it is: {e}",
-                            path.display()
-                        ))
-                    })?;
+                    path.display()
+                ))
+            })?;
             let backup = backup(&game.dir, &game.save_file).map_err(io_err)?;
             replace_file(&path, &image).map_err(io_err)?;
             Ok(SramOutcome::Downloaded { backup })
@@ -1421,9 +1427,7 @@ mod tests {
                         plant(&card(&game), &[("BASLUS-20152SYS/_pcsx2_index", b"index")]);
                     }
                     ps2::Layout::Image => {
-                        let image =
-                            ps2::card::apply_unit(None, &with_others, &|_| true, ps2::card::tod(0))
-                                .unwrap();
+                        let image = ps2::card::image_of(&with_others, ps2::card::tod(0));
                         std::fs::write(card(&game), image).unwrap();
                     }
                 }
@@ -1457,8 +1461,7 @@ mod tests {
                         }
                     }
                 } else {
-                    let image =
-                        ps2::card::apply_unit(None, &before, &|_| true, ps2::card::tod(0)).unwrap();
+                    let image = ps2::card::image_of(&before, ps2::card::tod(0));
                     std::fs::write(card(&game), image).unwrap();
                 }
 
@@ -1471,7 +1474,9 @@ mod tests {
                 };
                 let all = |g: &GameSaves| -> ps2::Unit {
                     if folder {
-                        ps2::folder::read_folders(&card(g), &|_| true).unwrap().0
+                        ps2::folder::read_folders(&card(g), &|_| true, &|_| false)
+                            .unwrap()
+                            .0
                     } else {
                         let bytes = std::fs::read(card(g)).unwrap();
                         ps2::card::Card::parse(bytes)
@@ -1637,8 +1642,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let game = ps2_game(dir.path(), "armsx2");
             let fixture = crate::ps2::archive::tests::futurama_like();
-            let image =
-                ps2::card::apply_unit(None, &fixture, &|_| true, ps2::card::tod(0)).unwrap();
+            let image = ps2::card::image_of(&fixture, ps2::card::tod(0));
             std::fs::create_dir_all(card(&game).parent().unwrap()).unwrap();
             std::fs::write(card(&game), &image).unwrap();
             let outcome = sync_sram(&client(&server), "dev", &game).await.unwrap();

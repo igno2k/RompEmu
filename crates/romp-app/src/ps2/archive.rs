@@ -10,10 +10,11 @@
 //! in them rather than by their bytes (`hash_zip_contents`), which `content_hash` reproduces.
 
 use super::card::valid_name;
+use super::meta::{self, is_meta};
 use super::rule::{is_card_file, UnitRule};
 use super::{Files, Unit};
 use md5::{Digest, Md5};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Write};
 
 /// The most a PS2 save zip may unpack to. A card holds 8 MB, so a zip declaring more is not
@@ -125,12 +126,22 @@ fn read_entry(entry: &mut zip::read::ZipFile<'_, Cursor<&[u8]>>) -> Result<Vec<u
     Ok(data)
 }
 
+/// A save downloaded for a game: its folders, and the `_pcsx2_index` files the zip had for
+/// them, which a folder card keeps but which are not part of the save.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Download {
+    pub unit: Unit,
+    pub indexes: BTreeMap<String, Vec<u8>>,
+}
+
 /// The game's save folders in a zip, and the names of the roots left out as not the game's.
 ///
 /// Folders `rule` does not claim are left out, never unpacked, whatever else the zip holds;
-/// so are PCSX2's own `_pcsx2_*` files, which describe the card they came from. A zip whose
-/// roots include none of the game's folders is read one level down, as a whole card.
-pub fn read(bytes: &[u8], rule: &UnitRule) -> Result<(Unit, Vec<String>), String> {
+/// so is the card's own `_pcsx2_superblock`. In a save folder, PCSX2's metadata files are part
+/// of the save and are taken in canonical form (see [`super::meta`]); its `_pcsx2_index` is
+/// kept apart. A zip whose roots include none of the game's folders is read one level down,
+/// as a whole card.
+pub fn read(bytes: &[u8], rule: &UnitRule) -> Result<(Download, Vec<String>), String> {
     let mut zip = open(bytes)?;
     let mut entries = Vec::new();
     for i in 0..zip.len() {
@@ -157,6 +168,7 @@ pub fn read(bytes: &[u8], rule: &UnitRule) -> Result<(Unit, Vec<String>), String
     let strip = usize::from(card_rooted);
 
     let mut unit = Unit::new();
+    let mut indexes = BTreeMap::new();
     let mut left_out = BTreeSet::new();
     for (i, parts, is_dir) in entries {
         let Some(parts) = parts.get(strip..).filter(|p| !p.is_empty()) else {
@@ -181,26 +193,42 @@ pub fn read(bytes: &[u8], rule: &UnitRule) -> Result<(Unit, Vec<String>), String
             }
             continue;
         }
-        if is_card_file(&parts[1]) {
-            continue;
-        }
-        if parts.len() > 2 || is_dir {
+        let key = match (&parts[1..], is_dir) {
+            (_, true) if parts.len() == 2 && parts[1] == meta::FILE_META => continue,
+            ([file], false) if file == meta::INDEX => {
+                let data = read_entry(&mut zip.by_index(i).map_err(unreadable)?)?;
+                indexes.insert(folder.clone(), data);
+                continue;
+            }
+            ([file], false) if file == meta::DIR_META || !is_card_file(file) => file.clone(),
+            ([meta_dir, file], false) if meta_dir == meta::FILE_META && valid_name(file) => {
+                meta::file_meta_key(file)
+            }
+            ([file], false) if is_card_file(file) => continue,
+            _ => {
+                return Err(format!(
+                    "the save zip has a folder inside {folder}; PS2 saves have none"
+                ))
+            }
+        };
+        if !is_meta(&key) && !valid_name(&key) {
             return Err(format!(
-                "the save zip has a folder inside {folder}; PS2 saves have none"
-            ));
-        }
-        let file = &parts[1];
-        if !valid_name(file) {
-            return Err(format!(
-                "the save zip has a file a memory card can't hold, {folder}/{file}"
+                "the save zip has a file a memory card can't hold, {folder}/{key}"
             ));
         }
         let data = read_entry(&mut zip.by_index(i).map_err(unreadable)?)?;
-        if files.insert(file.clone(), data).is_some() {
-            return Err(format!("the save zip holds {folder}/{file} twice"));
+        if files.insert(key.clone(), data).is_some() {
+            return Err(format!("the save zip holds {folder}/{key} twice"));
         }
     }
-    Ok((unit, left_out.into_iter().collect()))
+    let unit = unit
+        .into_iter()
+        .map(|(folder, files)| {
+            let files = meta::canonical(&folder, &files);
+            (folder, files)
+        })
+        .collect();
+    Ok((Download { unit, indexes }, left_out.into_iter().collect()))
 }
 
 #[cfg(test)]
@@ -314,7 +342,9 @@ pub(crate) mod tests {
             ("_pcsx2_index", b"a card's"),
             ("BASLUS-20152AC04/_pcsx2_index", b"a card's"),
         ]);
-        let (unit, left_out) = read(&zip, &rule("SLUS-20152")).unwrap();
+        let (download, left_out) = read(&zip, &rule("SLUS-20152")).unwrap();
+        assert_eq!(download.indexes["BASLUS-20152AC04"], b"a card's");
+        let unit = download.unit;
         assert_eq!(
             unit,
             super::tests::unit(&[("BASLUS-20152AC04", "icon.sys", b"mine")])
@@ -338,11 +368,47 @@ pub(crate) mod tests {
             ("test/BASLUS-20152AC04/ace.bin", b"server-save"),
             ("test/BASLUS-21693XX/other.bin", b"not ours"),
         ]);
-        let (unit, _) = read(&zip, &rule("BASLUS-20152")).unwrap();
+        let (Download { unit, .. }, _) = read(&zip, &rule("BASLUS-20152")).unwrap();
         assert_eq!(
             unit,
             super::tests::unit(&[("BASLUS-20152AC04", "ace.bin", b"server-save")])
         );
+    }
+
+    #[test]
+    fn pcsx2_metadata_travels_in_canonical_form() {
+        use crate::ps2::card::tests::meta_entry;
+        // As PCSX2 wrote it on a folder card: the entry's cluster there, 750.
+        let mut on_card = meta_entry(b"BASLUS-20314-TS2-OPT", 0x842F, 0, 4);
+        on_card[16..20].copy_from_slice(&750u32.to_le_bytes());
+        let standard = meta_entry(b"icon.sys", meta::FILE_MODE, 0, 4);
+        let zip = foreign_zip(&[
+            ("BASLUS-20314-TS2-OPT/icon.sys", b"icon"),
+            ("BASLUS-20314-TS2-OPT/save", b"s"),
+            ("BASLUS-20314-TS2-OPT/_pcsx2_meta_directory", &on_card),
+            ("BASLUS-20314-TS2-OPT/_pcsx2_meta/", b""),
+            ("BASLUS-20314-TS2-OPT/_pcsx2_meta/icon.sys", &standard),
+            ("BASLUS-20314-TS2-OPT/_pcsx2_index", b"{}"),
+        ]);
+        let (download, _) = read(&zip, &rule("SLUS-20314")).unwrap();
+        let files = &download.unit["BASLUS-20314-TS2-OPT"];
+        assert_eq!(
+            files[meta::DIR_META],
+            meta_entry(b"BASLUS-20314-TS2-OPT", 0x842F, 0, 4)
+        );
+        assert!(
+            !files.contains_key(&meta::file_meta_key("icon.sys")),
+            "PCSX2 keeps none"
+        );
+        assert!(!files.contains_key(meta::INDEX));
+        let built = build(&download.unit).unwrap();
+        let names: Vec<String> = zip::ZipArchive::new(Cursor::new(&built[..]))
+            .unwrap()
+            .file_names()
+            .map(str::to_string)
+            .collect();
+        assert!(names.contains(&"BASLUS-20314-TS2-OPT/_pcsx2_meta_directory".to_string()));
+        assert!(!names.iter().any(|n| n.ends_with("_pcsx2_index")));
     }
 
     #[test]

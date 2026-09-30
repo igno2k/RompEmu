@@ -23,8 +23,9 @@
 //! new one is written into free clusters, so every other folder's clusters stay byte for byte
 //! as they were. The ECC matches bazzite-maint's `romm-save-import`, checked against real cards.
 
+use super::meta::{self, file_meta_key, is_meta};
+use super::rule::UnitRule;
 use super::{Files, Unit};
-use std::collections::BTreeMap;
 
 pub const PAGE: usize = 512;
 const SPARE: usize = 16;
@@ -45,8 +46,8 @@ const ENTRY: usize = 512;
 const MODE_EXISTS: u16 = 0x8000;
 const MODE_DIR: u16 = 0x0020;
 const MODE_FILE: u16 = 0x0010;
-const DIR_MODE: u16 = 0x8427;
-const FILE_MODE: u16 = 0x8497;
+const DIR_MODE: u16 = meta::DIR_MODE;
+const FILE_MODE: u16 = meta::FILE_MODE;
 const IN_USE: u32 = 0x8000_0000;
 const CHAIN_END: u32 = 0x7FFF_FFFF;
 /// The longest name a card entry holds, its terminating zero aside.
@@ -180,6 +181,23 @@ fn check_name(name: &str) -> Result<()> {
     }
 }
 
+/// The name a metadata file gives an entry, checked against the card's rules and against
+/// the host name PCSX2 would give it.
+fn check_real_name(real: &[u8], host: &str) -> Result<()> {
+    let ok = !real.is_empty()
+        && real.len() <= NAME_MAX
+        && !real.iter().any(|b| b"/?*".contains(b) || *b < 0x20)
+        && meta::clean(real) == host.as_bytes();
+    if ok {
+        Ok(())
+    } else {
+        fail(format!(
+            "the metadata of {host} names it {:?}, which doesn't fit",
+            String::from_utf8_lossy(real)
+        ))
+    }
+}
+
 /// One directory entry: a save folder, or a file inside one.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -187,18 +205,20 @@ pub struct Entry {
     length: u32,
     cluster: u32,
     modified: [u8; 8],
+    /// The name PCSX2 gives its host file or folder, the card's name cleaned.
     name: String,
+    raw: Vec<u8>,
 }
 
 impl Entry {
     fn parse(raw: &[u8]) -> Self {
-        let name = raw[64..96].split(|&b| b == 0).next().unwrap_or_default();
         Entry {
             mode: u16_at(raw, 0),
             length: u32_at(raw, 4),
             cluster: u32_at(raw, 16),
             modified: raw[24..32].try_into().expect("8 bytes"),
-            name: String::from_utf8_lossy(name).into_owned(),
+            name: String::from_utf8_lossy(&meta::clean(meta::real_name(raw))).into_owned(),
+            raw: raw.to_vec(),
         }
     }
 
@@ -427,10 +447,24 @@ impl Card {
             .collect())
     }
 
-    /// Every file in a save folder, by name. A save folder never holds another folder, and
-    /// one that does is refused rather than copied in part.
+    /// A save folder as a PCSX2 folder card holds it: its files by host name, and the
+    /// metadata files PCSX2 writes for entries that need them (see [`meta`]), in canonical
+    /// form. A save folder never holds another folder, and one that does is refused rather
+    /// than copied in part, as is one whose names no computer can hold.
     pub fn files(&self, folder: &Entry) -> Result<Files> {
+        self.folder_files(folder, true)
+    }
+
+    /// A save folder's files; `strict` refuses names a computer can't hold, which only
+    /// matters for folders that are going to one.
+    fn folder_files(&self, folder: &Entry, strict: bool) -> Result<Files> {
+        if strict && !valid_name(&folder.name) {
+            return fail(format!("{:?} can't be a folder on a computer", folder.name));
+        }
+        let folder_cleaned =
+            meta::clean(meta::real_name(&folder.raw)) != meta::real_name(&folder.raw);
         let mut files = Files::new();
+        let mut metas = Files::new();
         for e in self.entries(folder.cluster, folder.length)?.iter().skip(2) {
             if !e.exists() {
                 continue;
@@ -438,20 +472,43 @@ impl Card {
             if e.is_dir() || e.mode & MODE_FILE == 0 {
                 return fail(format!("{}/{} is not a file", folder.name, e.name));
             }
+            if strict && (!valid_name(&e.name) || is_meta(&e.name) || e.name == meta::INDEX) {
+                return fail(format!(
+                    "{}/{:?} can't be a file on a computer",
+                    folder.name, e.name
+                ));
+            }
             let data = self.read(e.cluster, e.length as usize)?;
+            if meta::is_nonstandard(&e.raw, FILE_MODE, folder_cleaned) {
+                metas.insert(
+                    file_meta_key(&e.name),
+                    meta::canonical_entry(&e.raw, e.length),
+                );
+            }
             if files.insert(e.name.clone(), data).is_some() {
                 return fail(format!("{} holds two files named {}", folder.name, e.name));
             }
         }
+        if meta::is_nonstandard(&folder.raw, DIR_MODE, false) {
+            let count = 2 + files.len() as u32;
+            files.insert(
+                meta::DIR_META.into(),
+                meta::canonical_entry(&folder.raw, count),
+            );
+        }
+        files.extend(metas);
         Ok(files)
     }
 
-    /// Every save folder on the card with its files.
+    /// Every save folder on the card with its files, by host name, for comparing a card
+    /// before and after a change; other games' folders need no names a computer can hold.
     pub fn all_folders(&self) -> Result<Unit> {
         let mut unit = Unit::new();
         for folder in self.folders()? {
-            let files = self.files(&folder)?;
-            unit.insert(folder.name.clone(), files);
+            let files = self.folder_files(&folder, false)?;
+            if unit.insert(folder.name.clone(), files).is_some() {
+                return fail(format!("the card holds two folders named {}", folder.name));
+            }
         }
         Ok(unit)
     }
@@ -554,6 +611,7 @@ impl Card {
         for i in 2..raw.len() / ENTRY {
             let e = Entry::parse(&raw[i * ENTRY..(i + 1) * ENTRY]);
             if !(e.exists() && e.is_dir() && e.name == name) {
+                // Matched by host name, which is what a unit names folders by.
                 continue;
             }
             for child in self.entries(e.cluster, e.length)?.iter().skip(2) {
@@ -571,35 +629,54 @@ impl Card {
         Ok(deleted)
     }
 
-    /// Writes a new root save folder holding `files`, dated `when`.
+    /// Writes a new root save folder holding `files`, dated `when`. Where the files carry
+    /// PCSX2 metadata, the entries take their real name, mode, attributes and dates from it,
+    /// as PCSX2 does when it loads a folder card.
     pub fn add_folder(&mut self, name: &str, files: &Files, when: [u8; 8]) -> Result<()> {
         check_name(name)?;
+        let dir_template = files.get(meta::DIR_META).map(|raw| meta::loaded(raw, name));
+        if let Some(t) = &dir_template {
+            check_real_name(meta::real_name(t), name)?;
+        }
         let mut raw = self.root_raw()?;
         let slot = (2..raw.len() / ENTRY)
             .find(|&i| !Entry::parse(&raw[i * ENTRY..(i + 1) * ENTRY]).exists())
             .unwrap_or(raw.len() / ENTRY);
         let mut body = Vec::new();
-        for (file, data) in files {
+        let mut count = 2u32;
+        for (file, data) in files.iter().filter(|(key, _)| !is_meta(key)) {
             check_name(file)?;
             let Ok(length) = u32::try_from(data.len()) else {
                 return fail(format!("{name}/{file} is too large for a memory card"));
             };
+            let template = files
+                .get(&file_meta_key(file))
+                .map(|raw| meta::loaded(raw, file));
+            if let Some(t) = &template {
+                check_real_name(meta::real_name(t), file)?;
+            }
             // An empty file has no clusters, which the console marks with an all-ones cluster.
             let cluster = if data.is_empty() {
                 u32::MAX
             } else {
                 self.write_new(data)?
             };
-            body.extend(entry(file, FILE_MODE, length, cluster, when, 0));
+            body.extend(match template {
+                Some(t) => placed(t, length, cluster),
+                None => entry(file, FILE_MODE, length, cluster, when, 0),
+            });
+            count += 1;
         }
         // "." points back at this folder's own entry in the root, ".." is empty; both carry
         // the folder mode, which is what the console writes.
-        let count = 2 + files.len() as u32;
         let mut own = entry(".", DIR_MODE, 0, self.root, when, slot as u32);
         own.extend(entry("..", DIR_MODE, 0, 0, when, 0));
         own.extend(body);
         let here = self.write_new(&own)?;
-        let new = entry(name, DIR_MODE, count, here, when, 0);
+        let new = match dir_template {
+            Some(t) => placed(t, count, here),
+            None => entry(name, DIR_MODE, count, here, when, 0),
+        };
         if slot * ENTRY < raw.len() {
             raw[slot * ENTRY..(slot + 1) * ENTRY].copy_from_slice(&new);
         } else {
@@ -609,6 +686,13 @@ impl Card {
         }
         self.rewrite(self.root, &raw)
     }
+}
+
+/// An entry from PCSX2 metadata, with the length and first cluster it has on this card.
+fn placed(mut entry: Vec<u8>, length: u32, cluster: u32) -> Vec<u8> {
+    entry[4..8].copy_from_slice(&length.to_le_bytes());
+    entry[16..20].copy_from_slice(&cluster.to_le_bytes());
+    entry
 }
 
 /// The superblock page of a freshly formatted 8 MB card, as the console formats one. The
@@ -691,72 +775,84 @@ pub fn read_unit(data: &[u8], owns: &dyn Fn(&str) -> bool) -> Result<Unit> {
     let mut unit = Unit::new();
     for folder in card.folders()? {
         if owns(folder.name()) {
-            check_name(folder.name())?;
-            unit.insert(folder.name().to_string(), card.files(&folder)?);
+            let files = card.files(&folder)?;
+            if unit.insert(folder.name().to_string(), files).is_some() {
+                return fail(format!(
+                    "the card holds two folders named {}",
+                    folder.name()
+                ));
+            }
         }
     }
     Ok(unit)
 }
 
-/// The card `original` with the folders `owns` claims replaced by `unit`, every other folder
-/// left as it was. A missing or blank card is formatted first, keeping the ECC layout of the
-/// file it replaces. The result is read back through a fresh parse before it is returned, and
-/// refused unless it holds exactly `unit` beside the other folders, unchanged.
+/// A card holding exactly `unit`, for tests to start from.
+#[cfg(test)]
+pub fn image_of(unit: &Unit, when: [u8; 8]) -> Vec<u8> {
+    let mut card = Card::parse(format_card(true, when)).expect("a formatted card");
+    for (name, files) in unit {
+        card.add_folder(name, files, when)
+            .expect("room on the card");
+    }
+    card.image()
+}
+
+/// The card `original` with the game's own folders replaced by those in `unit`, the shared
+/// ones in it written only where the card has none, and every other folder left as it was.
+/// A missing or blank card is formatted first, with the ECC LRPS2 writes. The result is read
+/// back through a fresh parse before it is returned, and refused unless it holds exactly
+/// that.
 pub fn apply_unit(
     original: Option<&[u8]>,
     unit: &Unit,
-    owns: &dyn Fn(&str) -> bool,
+    rule: &UnitRule,
     when: [u8; 8],
 ) -> Result<Vec<u8>> {
+    if let Some(stray) = unit.keys().find(|name| !rule.owns(name)) {
+        return fail(format!("{stray} is not a save folder of {}", rule.key()));
+    }
     let mut card = match original {
         Some(bytes) if !is_blank(bytes) => Card::parse(bytes.to_vec())?,
-        other => Card::parse(format_card(
-            other.is_none_or(|b| b.len() != PLAIN_SIZE),
-            when,
-        ))?,
+        _ => Card::parse(format_card(true, when))?,
     };
     let before = card.all_folders()?;
-    let replaced: Vec<&String> = before
+    let replaced: Vec<String> = before.keys().filter(|n| rule.is_own(n)).cloned().collect();
+    let added: Vec<&String> = unit
         .keys()
-        .filter(|name| owns(name) || unit.contains_key(*name))
+        .filter(|n| rule.is_own(n) || !before.contains_key(*n))
         .collect();
     for name in &replaced {
         card.delete_folder(name)?;
     }
-    for (name, files) in unit {
-        card.add_folder(name, files, when)?;
+    for name in &added {
+        card.add_folder(name, &unit[*name], when)?;
     }
     let image = card.image();
     let after = Card::parse(image.clone())?.all_folders()?;
-    let kept: BTreeMap<&String, &Files> = before
-        .iter()
+    let mut expected: Unit = before
+        .into_iter()
         .filter(|(name, _)| !replaced.contains(name))
         .collect();
-    for (name, files) in unit {
-        if after.get(name) != Some(files) {
-            return fail(format!(
-                "{name} did not read back from the memory card as written"
-            ));
-        }
+    for name in added {
+        expected.insert(name.clone(), unit[name].clone());
     }
-    for (name, files) in &kept {
-        if after.get(*name) != Some(*files) {
-            return fail(format!(
-                "{name} changed on the memory card while another game's saves were written"
-            ));
-        }
-    }
-    if let Some(extra) = after
-        .keys()
-        .find(|name| !unit.contains_key(*name) && !kept.contains_key(name))
-    {
-        return fail(format!("{extra} appeared on the memory card unasked"));
+    if after != expected {
+        let differs = after
+            .keys()
+            .chain(expected.keys())
+            .find(|n| after.get(*n) != expected.get(*n))
+            .cloned()
+            .unwrap_or_default();
+        return fail(format!(
+            "{differs} did not read back from the memory card as it should"
+        ));
     }
     Ok(image)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn files(entries: &[(&str, &[u8])]) -> Files {
@@ -767,6 +863,27 @@ mod tests {
     }
 
     const WHEN: [u8; 8] = [0, 5, 4, 3, 2, 1, 0xEA, 0x07];
+
+    fn rule(key: &str) -> UnitRule {
+        UnitRule::new(key, &crate::ps2::GameDb::empty()).unwrap()
+    }
+
+    /// Gran Turismo 4, which reads Gran Turismo 3's saves (its GameDB memcardFilters).
+    pub(crate) fn gt4() -> UnitRule {
+        let db = crate::ps2::GameDb::parse(
+            "SCUS-97328:\n  memcardFilters:\n    - \"SCUS-97328\"\n    - \"SCUS-97102\"\n",
+        );
+        UnitRule::new("SCUS-97328", &db).unwrap()
+    }
+
+    /// A metadata entry as PCSX2 writes one, in canonical form.
+    pub(crate) fn meta_entry(name: &[u8], mode: u16, attr: u32, length: u32) -> Vec<u8> {
+        let mut raw = entry("x", mode, length, 0, [0, 40, 25, 1, 5, 2, 0xE7, 0x07], 0);
+        raw[0x20..0x24].copy_from_slice(&attr.to_le_bytes());
+        raw[64..96].fill(0);
+        raw[64..64 + name.len()].copy_from_slice(name);
+        raw
+    }
 
     fn card_with(folders: &[(&str, Files)]) -> Vec<u8> {
         let mut card = Card::parse(format_card(true, WHEN)).unwrap();
@@ -868,7 +985,7 @@ mod tests {
         let new = files(&[("icon.sys", b"new icon"), ("save", &[2u8; 9000])]);
         let unit = Unit::from([("BASLUS-20152AC04".to_string(), new.clone())]);
         let owns = |n: &str| n.starts_with("BASLUS-20152");
-        let written = apply_unit(Some(&image), &unit, &owns, WHEN).unwrap();
+        let written = apply_unit(Some(&image), &unit, &rule("SLUS-20152"), WHEN).unwrap();
 
         let after = Card::parse(written.clone()).unwrap();
         let all = after.all_folders().unwrap();
@@ -899,17 +1016,126 @@ mod tests {
         ]);
         let unit = Unit::from([("BASLUS-20152AC04".to_string(), files(&[("a", b"3")]))]);
         let owns = |n: &str| n.starts_with("BASLUS-20152");
-        let written = apply_unit(Some(&image), &unit, &owns, WHEN).unwrap();
+        let written = apply_unit(Some(&image), &unit, &rule("SLUS-20152"), WHEN).unwrap();
         assert_eq!(read_unit(&written, &owns).unwrap(), unit);
+    }
+
+    #[test]
+    fn shared_folders_are_written_only_where_the_card_has_none() {
+        let gt4_save = files(&[("save", b"GT4 progress")]);
+        let gt3_local = files(&[("garage", b"the GT3 garage as saved here")]);
+        let image = card_with(&[
+            ("BASCUS-97328GT4", files(&[("save", b"old GT4")])),
+            ("BASCUS-97102GT3", gt3_local.clone()),
+        ]);
+        let all = |_: &str| true;
+        // A pull without GT3 keeps the card's GT3.
+        let without = Unit::from([("BASCUS-97328GT4".to_string(), gt4_save.clone())]);
+        let written = apply_unit(Some(&image), &without, &gt4(), WHEN).unwrap();
+        let after = read_unit(&written, &all).unwrap();
+        assert_eq!(after["BASCUS-97102GT3"], gt3_local);
+        assert_eq!(after["BASCUS-97328GT4"], gt4_save);
+        // A pull with a stale GT3 doesn't overwrite it.
+        let mut with = without.clone();
+        with.insert("BASCUS-97102GT3".into(), files(&[("garage", b"stale")]));
+        let written = apply_unit(Some(&image), &with, &gt4(), WHEN).unwrap();
+        assert_eq!(
+            read_unit(&written, &all).unwrap()["BASCUS-97102GT3"],
+            gt3_local
+        );
+        // Where the card has no GT3, the pulled one is written.
+        let bare = card_with(&[]);
+        let written = apply_unit(Some(&bare), &with, &gt4(), WHEN).unwrap();
+        assert_eq!(read_unit(&written, &all).unwrap(), with);
+    }
+
+    #[test]
+    fn metadata_round_trips_through_the_card() {
+        // A copy-protected save as the real BASLUS-20314-TS2-OPT: mode 0x842F on the folder.
+        let mut save = files(&[
+            ("icon.sys", b"icon"),
+            ("BASLUS-20314-TS2-OPT", &[5u8; 1500]),
+        ]);
+        save.insert(
+            meta::DIR_META.into(),
+            meta_entry(b"BASLUS-20314-TS2-OPT", 0x842F, 0, 4),
+        );
+        save.insert(
+            file_meta_key("icon.sys"),
+            meta_entry(b"icon.sys", 0x8417, 0, 4),
+        );
+        // A folder whose PS2 name a computer can't hold: its host name is cleaned.
+        let mut cleaned = files(&[("f", b"x")]);
+        cleaned.insert(
+            meta::DIR_META.into(),
+            meta_entry(b"BASLUS-20314:B", DIR_MODE, 0, 3),
+        );
+        cleaned.insert(file_meta_key("f"), meta_entry(b"f", FILE_MODE, 0, 1));
+        let unit = Unit::from([
+            ("BASLUS-20314-TS2-OPT".to_string(), save),
+            ("BASLUS-20314_B".to_string(), cleaned),
+        ]);
+        let written = apply_unit(None, &unit, &rule("SLUS-20314"), WHEN).unwrap();
+        assert_eq!(read_unit(&written, &|_| true).unwrap(), unit);
+        let card = Card::parse(written).unwrap();
+        let folders = card.folders().unwrap();
+        let ts2 = folders
+            .iter()
+            .find(|f| f.name() == "BASLUS-20314-TS2-OPT")
+            .unwrap();
+        assert_eq!(
+            ts2.mode, 0x842F,
+            "the card keeps the save's copy protection"
+        );
+        let b = folders
+            .iter()
+            .find(|f| f.name() == "BASLUS-20314_B")
+            .unwrap();
+        assert_eq!(
+            meta::real_name(&b.raw),
+            b"BASLUS-20314:B",
+            "and its real name"
+        );
+    }
+
+    #[test]
+    fn another_games_odd_name_does_not_block_this_games_pull() {
+        // A folder name with a character no computer's file system takes, on another game.
+        let mut card = Card::parse(format_card(true, WHEN)).unwrap();
+        card.add_folder("BASLUS-99999", &files(&[("a", b"x")]), WHEN)
+            .unwrap();
+        let mut raw = card.root_raw().unwrap();
+        raw[2 * ENTRY + 64 + "BASLUS-99999".len()] = b'?';
+        card.rewrite(card.root, &raw).unwrap();
+        assert!(card.files(&card.folders().unwrap()[0]).is_err());
+        let unit = Unit::from([("BASLUS-20152AC04".to_string(), files(&[("s", b"1")]))]);
+        let written = apply_unit(Some(&card.image()), &unit, &rule("SLUS-20152"), WHEN).unwrap();
+        assert_eq!(
+            read_unit(&written, &|n| n.starts_with("BASLUS-20152")).unwrap(),
+            unit
+        );
+    }
+
+    #[test]
+    fn metadata_that_names_another_folder_is_refused() {
+        let mut odd = files(&[("f", b"x")]);
+        odd.insert(
+            meta::DIR_META.into(),
+            meta_entry(b"BASLUS-20314ELSE", 0x842F, 0, 3),
+        );
+        let unit = Unit::from([("BASLUS-20314-TS2".to_string(), odd)]);
+        assert!(apply_unit(None, &unit, &rule("SLUS-20314"), WHEN).is_err());
     }
 
     #[test]
     fn a_blank_or_missing_card_is_formatted_first() {
         let unit = Unit::from([("BESLES-50330X".to_string(), files(&[("f", b"x")]))]);
         let owns = |_: &str| true;
-        let plain = apply_unit(Some(&vec![0xFF; PLAIN_SIZE]), &unit, &owns, WHEN).unwrap();
-        assert_eq!(plain.len(), PLAIN_SIZE);
-        let fresh = apply_unit(None, &unit, &owns, WHEN).unwrap();
+        let r = rule("SLES-50330");
+        // Always the layout LRPS2 writes, with ECC, even over a blank card without it.
+        let plain = apply_unit(Some(&vec![0xFF; PLAIN_SIZE]), &unit, &r, WHEN).unwrap();
+        assert_eq!(plain.len(), IMAGE_SIZE);
+        let fresh = apply_unit(None, &unit, &r, WHEN).unwrap();
         assert_eq!(fresh.len(), IMAGE_SIZE);
         assert_eq!(read_unit(&fresh, &owns).unwrap(), unit);
         assert!(read_unit(&[0xFF; 64], &owns).unwrap().is_empty());
@@ -919,9 +1145,8 @@ mod tests {
     fn what_is_not_a_card_is_refused() {
         assert!(Card::parse(vec![0; IMAGE_SIZE]).is_err());
         assert!(Card::parse(b"PK\x03\x04".to_vec()).is_err());
-        let owns = |_: &str| true;
         let unit = Unit::new();
-        assert!(apply_unit(Some(b"not a card"), &unit, &owns, WHEN).is_err());
+        assert!(apply_unit(Some(b"not a card"), &unit, &rule("SLUS-20152"), WHEN).is_err());
     }
 
     #[test]
@@ -951,12 +1176,15 @@ mod tests {
             assert!(!valid_name(bad), "{bad:?}");
         }
         let unit = Unit::from([("../evil".to_string(), files(&[("f", b"x")]))]);
-        assert!(apply_unit(None, &unit, &|_| true, WHEN).is_err());
+        assert!(apply_unit(None, &unit, &rule("SLUS-20152"), WHEN).is_err());
     }
 
     #[test]
     fn the_card_fills_up_rather_than_overwriting() {
-        let unit = Unit::from([("BIG".to_string(), files(&[("f", &vec![0u8; 9_000_000])]))]);
-        assert!(apply_unit(None, &unit, &|_| true, WHEN).is_err());
+        let unit = Unit::from([(
+            "BASLUS-20152BIG".to_string(),
+            files(&[("f", &vec![0u8; 9_000_000])]),
+        )]);
+        assert!(apply_unit(None, &unit, &rule("SLUS-20152"), WHEN).is_err());
     }
 }
